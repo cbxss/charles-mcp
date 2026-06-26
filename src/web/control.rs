@@ -85,15 +85,24 @@ impl WebClient {
         let html = self
             .get_control_text(&format!("tools/{}/", tool.segment()))
             .await?;
+        // The page renders "Status: Enabled" / "Status: Disabled". Parse that
+        // specific marker rather than scanning the whole page (which would trip
+        // on the words "enable"/"disable" in action links or prose).
         let low = html.to_lowercase();
-        // "enabled" is not a substring of "disabled", so order-independent checks are safe.
-        if low.contains("disabled") {
+        let after = low
+            .split_once("status:")
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| {
+                CharlesError::Parse("no 'Status:' marker found on the tool page".into())
+            })?;
+        let window: String = after.chars().take(40).collect();
+        if window.contains("disabled") {
             Ok(false)
-        } else if low.contains("enabled") {
+        } else if window.contains("enabled") {
             Ok(true)
         } else {
             Err(CharlesError::Parse(
-                "could not find an enabled/disabled status in the tool page".into(),
+                "the tool page's 'Status:' marker had no enabled/disabled value".into(),
             ))
         }
     }

@@ -9,12 +9,14 @@ pub mod discovery;
 pub mod live;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use reqwest::{Client, StatusCode};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::error::CharlesError;
+use crate::session::Session;
 use crate::web::discovery::DiscoveredEndpoints;
 
 /// A thin, cloneable client over the Charles Web Interface.
@@ -24,6 +26,9 @@ pub struct WebClient {
     http: Client,
     /// Cached result of parsing the control page (cleared on failure).
     discovery: Arc<Mutex<Option<DiscoveredEndpoints>>>,
+    /// Cached live session within the configured TTL, to avoid re-exporting
+    /// Charles on every inspect call.
+    live_cache: Arc<Mutex<Option<(Instant, Session)>>>,
 }
 
 /// Outcome of a connectivity probe, surfaced by the `charles_status` tool.
@@ -50,6 +55,7 @@ impl WebClient {
             cfg,
             http,
             discovery: Arc::new(Mutex::new(None)),
+            live_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -120,12 +126,23 @@ impl WebClient {
             note: String::new(),
         };
         match self.get_control_text("").await {
-            Ok(_) => StatusReport {
-                reachable: true,
-                authenticated: true,
-                note: "Connected to the Charles Web Interface.".into(),
-                ..base
-            },
+            Ok(_) => {
+                // A 200 with no credentials sent means the Web Interface allows
+                // anonymous access — not that we authenticated.
+                let authed = self.cfg.web_user.is_some();
+                StatusReport {
+                    reachable: true,
+                    authenticated: authed,
+                    note: if authed {
+                        "Connected to the Charles Web Interface (authenticated).".into()
+                    } else {
+                        "Connected to the Charles Web Interface (anonymous access; no \
+                         credentials sent)."
+                            .into()
+                    },
+                    ..base
+                }
+            }
             Err(CharlesError::Unauthorized) => StatusReport {
                 reachable: true,
                 authenticated: false,

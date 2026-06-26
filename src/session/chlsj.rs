@@ -62,6 +62,10 @@ struct ChlsTxn {
     request: Option<ChlsMessage>,
     #[serde(default)]
     response: Option<ChlsMessage>,
+    /// True when Charles only saw an undecrypted HTTPS CONNECT tunnel (SSL
+    /// Proxying not enabled for the host) — the body is ciphertext.
+    #[serde(default)]
+    tunnel: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -77,6 +81,11 @@ struct ChlsMessage {
     sizes: Option<ChlsSizes>,
     #[serde(default, rename = "contentEncoding")]
     content_encoding: Option<String>,
+    /// Some Charles versions put the MIME/charset on the message, not the body.
+    #[serde(default, rename = "mimeType")]
+    mime_type: Option<String>,
+    #[serde(default)]
+    charset: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -132,21 +141,29 @@ impl ChlsMessage {
 
         let ct_header = header_value(&headers, "content-type").map(str::to_string);
         let header_ce = header_value(&headers, "content-encoding").map(str::to_string);
+        // MIME/charset can live on the header, the message, or the body
+        // depending on Charles version — try all three.
+        let msg_mime = self.mime_type.clone();
+        let msg_charset = self.charset.clone();
 
         let mut raw = RawBody {
             captured: false,
             ..Default::default()
         };
-        let mut mime = mime_essence(ct_header.as_deref());
+        let mut mime = mime_essence(ct_header.as_deref().or(msg_mime.as_deref()));
         let mut body_size = self.sizes.and_then(|s| s.body);
 
         if let Some(body) = self.body {
-            let ct = ct_header.clone().or_else(|| body.mime_type.clone());
+            let ct = ct_header
+                .clone()
+                .or_else(|| msg_mime.clone())
+                .or_else(|| body.mime_type.clone());
             mime = mime_essence(ct.as_deref()).or(mime);
             raw.content_type = ct.clone();
             raw.declared_charset = body
                 .charset
                 .clone()
+                .or_else(|| msg_charset.clone())
                 .or_else(|| charset_from_content_type(ct.as_deref()));
             raw.content_encoding =
                 normalize_encoding(self.content_encoding.clone()).or_else(|| header_ce.clone());
@@ -241,6 +258,7 @@ impl ChlsTxn {
             client_addr: self.client_address,
             remote_addr: self.remote_address,
             tls_version: self.tls_version,
+            tunnel: self.tunnel,
             error,
             request,
             response,
@@ -249,8 +267,14 @@ impl ChlsTxn {
 }
 
 fn is_failed_state(s: &str) -> bool {
+    // Charles's real failure state is EXCEPTION; the rest are defensive in case
+    // a version uses different wording. (COMPLETE/SUCCESS/RECEIVING_* are fine.)
     let s = s.to_ascii_uppercase();
-    s.contains("FAIL") || s.contains("ABORT") || s.contains("ERROR") || s.contains("TIMEOUT")
+    s.contains("EXCEPTION")
+        || s.contains("FAIL")
+        || s.contains("ABORT")
+        || s.contains("ERROR")
+        || s.contains("TIMEOUT")
 }
 
 fn get_f64(v: &Value, key: &str) -> Option<f64> {

@@ -52,15 +52,31 @@ pub struct Config {
     #[arg(long, env = "CHARLES_BODY_MAX_BYTES", default_value_t = 8_192)]
     pub body_max_bytes: usize,
 
+    /// How long (ms) to cache the live session so a burst of inspect calls
+    /// doesn't re-export Charles every time — this also keeps request indices
+    /// stable within the window. Set to 0 to disable caching.
+    #[arg(long, env = "CHARLES_CACHE_TTL_MS", default_value_t = 5_000)]
+    pub cache_ttl_ms: u64,
+
+    /// Timeout (ms) for the `charles convert` subprocess, so a license/GUI
+    /// prompt can't hang a tool call forever.
+    #[arg(long, env = "CHARLES_CONVERT_TIMEOUT_MS", default_value_t = 60_000)]
+    pub convert_timeout_ms: u64,
+
     /// Preferred format when fetching/exporting the live session.
     #[arg(long, env = "CHARLES_EXPORT_FORMAT", default_value = "chlsj")]
     pub default_export_format: String,
 }
 
 impl Config {
-    /// `http://host:port` URL of the Charles proxy.
+    /// `http://host:port` URL of the Charles proxy (brackets IPv6 hosts).
     pub fn proxy_url(&self) -> String {
-        format!("http://{}:{}", self.proxy_host, self.proxy_port)
+        let host = &self.proxy_host;
+        if host.contains(':') && !host.starts_with('[') {
+            format!("http://[{host}]:{}", self.proxy_port)
+        } else {
+            format!("http://{host}:{}", self.proxy_port)
+        }
     }
 
     /// Build a full `http://control.charles/<path>` URL (path may start with `/`).
@@ -74,5 +90,31 @@ impl Config {
 
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
+    }
+
+    pub fn cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.cache_ttl_ms)
+    }
+
+    pub fn convert_timeout(&self) -> Duration {
+        Duration::from_millis(self.convert_timeout_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(host: &str) -> Config {
+        let mut c = Config::parse_from(["charles-mcp"]);
+        c.proxy_host = host.to_string();
+        c
+    }
+
+    #[test]
+    fn proxy_url_brackets_ipv6() {
+        assert_eq!(cfg("127.0.0.1").proxy_url(), "http://127.0.0.1:8888");
+        assert_eq!(cfg("::1").proxy_url(), "http://[::1]:8888");
+        assert_eq!(cfg("[::1]").proxy_url(), "http://[::1]:8888");
     }
 }

@@ -54,9 +54,17 @@ Charles's Web Interface isn't a normal port — it's reached *through* the Charl
 charles-mcp ──HTTP──▶ Charles proxy (127.0.0.1:8888) ──internal──▶ control.charles
 ```
 
+## Limitations (read before trusting it on a live session)
+
+- **HTTPS needs SSL Proxying.** Charles only decrypts a host's HTTPS if you've enabled **Proxy → SSL Proxying** for it. Undecrypted requests are CONNECT tunnels — this server flags them explicitly (`⚠ HTTPS tunnel — not decrypted`) rather than pretending the body is missing.
+- **`set_tool` toggles master switches only.** `map-*`, `rewrite`, `*-list`, and `dns-spoofing` do nothing without **rules** (GUI-only; not managed here). **`breakpoints` will pause/hang matching traffic** waiting for manual action in Charles — this server can't respond to breakpoints. Both cases are called out in the tool output.
+- **Live inspection re-exports the session** (cached for `--cache-ttl-ms`, default 5s, which also keeps indices stable in a burst). Large sessions can be slow or hit `--timeout-ms`.
+- **`charles convert`** runs the Charles binary; it can collide with a running instance. Bounded by `--convert-timeout-ms`.
+- WebSockets/gRPC/protobuf bodies aren't decoded; they show as binary.
+
 ## Note: provisional schema ⚠️
 
-Built and tested **without a live Charles 5**, so the `.chlsj` field names and the Web-Interface endpoint paths are best-effort until validated against a real install. The `.har` path follows the public HAR 1.2 spec and is solid. 48 fixture-driven tests pass (`cargo test`).
+Built and tested **without a live Charles 5**, so the exact `.chlsj` field names and the session export/clear/quit endpoint paths are best-effort until validated against a real install (a schema mismatch now fails loudly instead of returning blank rows). The control verbs (recording/throttling/tools), basic auth, proxy routing, and the `.har` 1.2 path are grounded in the docs. 53 fixture-driven tests pass (`cargo test`).
 
 <details>
 <summary>Validate against a real Charles 5 (and lock in real fixtures)</summary>

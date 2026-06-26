@@ -77,6 +77,13 @@ pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) ->
     if let Some(e) = &t.error {
         out.push_str(&format!("error: {e}\n"));
     }
+    if t.tunnel {
+        out.push_str(
+            "⚠ HTTPS tunnel — NOT decrypted by Charles (SSL Proxying is off for this host). \
+             Bodies below are ciphertext, not real content. Enable Proxy → SSL Proxying \
+             Settings for this host to inspect it.\n",
+        );
+    }
     if let Some(d) = t.duration_ms {
         out.push_str(&format!("duration: {d:.0} ms\n"));
     }
@@ -92,18 +99,26 @@ pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) ->
     out.push_str("\n── request ──\n");
     render_headers(&mut out, &t.request.headers);
     out.push_str("\nbody:\n");
-    render_body(&mut out, req_body);
+    render_body_or_tunnel(&mut out, req_body, t.tunnel);
 
     out.push_str("\n── response ──\n");
     match &t.response {
         Some(resp) => {
             render_headers(&mut out, &resp.headers);
             out.push_str("\nbody:\n");
-            render_body(&mut out, resp_body);
+            render_body_or_tunnel(&mut out, resp_body, t.tunnel);
         }
         None => out.push_str("(no response captured)\n"),
     }
     out
+}
+
+fn render_body_or_tunnel(out: &mut String, body: &Body, tunnel: bool) {
+    if tunnel {
+        out.push_str("(encrypted — SSL Proxying not enabled for this host)\n");
+    } else {
+        render_body(out, body);
+    }
 }
 
 fn render_headers(out: &mut String, headers: &[(String, String)]) {

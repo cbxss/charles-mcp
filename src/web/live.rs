@@ -11,7 +11,7 @@ use reqwest::StatusCode;
 
 use super::WebClient;
 use crate::error::CharlesError;
-use crate::session::{Session, SessionSource, convert, sniff};
+use crate::session::{Session, SessionSource, convert, looks_like_schema_mismatch, sniff};
 use crate::web::discovery::{self, DiscoveredEndpoints, EndpointSpec};
 
 impl WebClient {
@@ -78,16 +78,38 @@ impl WebClient {
         }
     }
 
-    /// Fetch the live session and parse it. Prefers chlsj, then har, then the
-    /// native `.chls` + `charles convert` fallback.
+    /// Fetch the live session and parse it, served from a short-lived cache so a
+    /// burst of inspect calls doesn't re-export Charles every time (this also
+    /// keeps request indices stable within the TTL window).
     pub async fn fetch_live_session(&self) -> Result<Session, CharlesError> {
+        let ttl = self.config().cache_ttl();
+        if !ttl.is_zero()
+            && let Some((at, sess)) = self.live_cache.lock().await.as_ref()
+            && at.elapsed() < ttl
+        {
+            return Ok(sess.clone());
+        }
+        let session = self.fetch_live_session_uncached().await?;
+        if !ttl.is_zero() {
+            *self.live_cache.lock().await = Some((std::time::Instant::now(), session.clone()));
+        }
+        Ok(session)
+    }
+
+    /// Drop the cached live session (after a clear, or to force a refresh).
+    pub async fn invalidate_live_cache(&self) {
+        *self.live_cache.lock().await = None;
+    }
+
+    /// Prefers chlsj, then har, then native `.chls` + `charles convert`.
+    async fn fetch_live_session_uncached(&self) -> Result<Session, CharlesError> {
         // Surface unreachable/auth problems with a clear message before we start
-        // probing export endpoints (otherwise the user sees a misleading
-        // "endpoint not found" for the last fallback).
+        // probing export endpoints.
         self.discovered().await?;
         for fmt in ["chlsj", "har"] {
             if let Ok(bytes) = self.fetch_session_in_format(fmt).await
                 && let Ok(transactions) = sniff::parse_bytes(bytes)
+                && !looks_like_schema_mismatch(&transactions)
             {
                 return Ok(Session {
                     source: SessionSource::Live,
@@ -97,8 +119,15 @@ impl WebClient {
         }
         // Native download + convert (requires the Charles binary).
         let chls = self.download_native().await?;
-        let chlsj = convert::convert_bytes(self.config(), &chls, "chls").await?;
+        let chlsj = convert::convert_bytes(self.config(), &chls, "chls", "chlsj").await?;
         let transactions = sniff::parse_bytes(chlsj)?;
+        if looks_like_schema_mismatch(&transactions) {
+            return Err(CharlesError::Parse(
+                "exported the live session but every host/method is empty — the .chlsj schema \
+                 does not match this Charles version"
+                    .into(),
+            ));
+        }
         Ok(Session {
             source: SessionSource::Live,
             transactions,
@@ -129,6 +158,15 @@ impl WebClient {
             if let Some(bytes) = self.fetch_data("GET", &path, None).await {
                 return Ok(bytes);
             }
+        }
+
+        // 3. Last resort: download the native .chls and convert it locally to the
+        //    requested format (needs the Charles binary). This is what makes
+        //    export to har/chlsj robust even if the web-export endpoint is absent.
+        if let Ok(chls) = self.download_native().await
+            && let Ok(bytes) = convert::convert_bytes(self.config(), &chls, "chls", format).await
+        {
+            return Ok(bytes);
         }
 
         Err(CharlesError::EndpointNotFound("session export"))
@@ -175,46 +213,62 @@ impl WebClient {
         }
     }
 
-    /// Clear the current session (destructive).
+    /// Clear the current session (destructive). Invalidates the live cache so the
+    /// next inspect call reflects the now-empty session.
     pub async fn clear_session(&self) -> Result<(), CharlesError> {
         let d = self.discovered().await?;
-        if let Some(ep) = &d.clear {
-            if self.invoke(ep).await {
-                return Ok(());
+        let cleared = match &d.clear {
+            Some(ep) if self.invoke(ep).await => true,
+            _ => {
+                self.invalidate_discovery().await;
+                self.try_clear_candidates().await
             }
-            self.invalidate_discovery().await;
+        };
+        if cleared {
+            self.invalidate_live_cache().await;
+            Ok(())
+        } else {
+            Err(CharlesError::EndpointNotFound("session clear"))
         }
+    }
+
+    async fn try_clear_candidates(&self) -> bool {
         for path in ["session/clear-session", "session/clear"] {
-            if let Some((status, _)) = self.raw_request("POST", path, None).await
-                && status.is_success()
-            {
-                return Ok(());
-            }
-            if let Some((status, _)) = self.raw_request("GET", path, None).await
-                && status.is_success()
-            {
-                return Ok(());
+            for method in ["POST", "GET"] {
+                if let Some((status, _)) = self.raw_request(method, path, None).await
+                    && status.is_success()
+                {
+                    return true;
+                }
             }
         }
-        Err(CharlesError::EndpointNotFound("session clear"))
+        false
     }
 
     /// Quit Charles (destructive).
     pub async fn quit_charles(&self) -> Result<(), CharlesError> {
         let d = self.discovered().await?;
-        if let Some(ep) = &d.quit
-            && self.invoke(ep).await
-        {
-            return Ok(());
-        }
-        for path in ["quit", "application/quit", "shutdown"] {
-            if let Some((status, _)) = self.raw_request("GET", path, None).await
-                && status.is_success()
-            {
-                return Ok(());
+        // Fire the quit request best-effort. A *successful* quit tears down the
+        // proxy mid-request, so its return is unreliable — we verify by
+        // connectivity instead of trusting the response (the old bug reported a
+        // working quit as a failure and invited a retry).
+        if let Some(ep) = &d.quit {
+            let _ = self.raw_request(&ep.method, &ep.path, None).await;
+        } else {
+            for path in ["quit", "application/quit", "shutdown"] {
+                let _ = self.raw_request("GET", path, None).await;
             }
         }
-        Err(CharlesError::EndpointNotFound("quit"))
+        match self.get_control_text("").await {
+            // Control host no longer reachable → Charles quit. Success.
+            Err(CharlesError::Unreachable { .. }) => {
+                self.invalidate_live_cache().await;
+                self.invalidate_discovery().await;
+                Ok(())
+            }
+            // Still reachable → the quit endpoint was wrong/unsupported.
+            _ => Err(CharlesError::EndpointNotFound("quit")),
+        }
     }
 }
 

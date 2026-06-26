@@ -86,3 +86,36 @@ fn http_status_503() {
     assert_eq!(txns[4].status, Some(503));
     assert_eq!(txns[4].mime.as_deref(), Some("text/plain"));
 }
+
+#[test]
+fn exception_state_is_treated_as_error() {
+    // The fixture's failed txn uses Charles's real "EXCEPTION" state.
+    let txns = load();
+    assert!(txns[3].error.is_some());
+}
+
+#[test]
+fn https_tunnel_is_flagged_and_warned() {
+    use charles_mcp::format;
+    let raw = br#"[{"scheme":"https","host":"x.com","method":"CONNECT","path":"/","tunnel":true,
+        "response":{"status":200,"body":{"encoded":"AAEC"}}}]"#;
+    let txns = chlsj::parse(raw).unwrap();
+    assert!(txns[0].tunnel, "tunnel flag should be set");
+
+    let t = &txns[0];
+    let req = body::decode(&t.request.raw, 8192);
+    let resp = body::decode(&t.response.as_ref().unwrap().raw, 8192);
+    let detail = format::transaction_detail(t, &req, &resp);
+    assert!(detail.contains("HTTPS tunnel"));
+    assert!(detail.contains("SSL Proxying"));
+    // It must NOT render the ciphertext as if it were a real body.
+    assert!(detail.contains("encrypted"));
+}
+
+#[test]
+fn schema_mismatch_is_detected() {
+    use charles_mcp::session::looks_like_schema_mismatch;
+    let mismatched = chlsj::parse(br#"[{"foo":1},{"bar":2}]"#).unwrap();
+    assert!(looks_like_schema_mismatch(&mismatched));
+    assert!(!looks_like_schema_mismatch(&load()));
+}

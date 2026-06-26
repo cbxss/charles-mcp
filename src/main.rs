@@ -23,6 +23,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::parse());
+    if cfg.web_pass.is_some() && cfg.web_user.is_none() {
+        tracing::warn!(
+            "--web-pass is set without --web-user; the password is ignored (basic auth needs both)"
+        );
+    }
     tracing::info!(proxy = %cfg.proxy_url(), "starting charles-mcp");
 
     let server = CharlesServer::new(cfg).context("initializing Charles server")?;

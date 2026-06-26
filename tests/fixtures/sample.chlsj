@@ -99,7 +99,7 @@
     }
   },
   {
-    "status": "FAILED",
+    "status": "EXCEPTION",
     "scheme": "https",
     "host": "api.example.com",
     "actualPort": 443,

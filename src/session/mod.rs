@@ -54,6 +54,11 @@ pub struct Transaction {
     pub client_addr: Option<String>,
     pub remote_addr: Option<String>,
     pub tls_version: Option<String>,
+    /// True for an HTTPS CONNECT tunnel Charles did NOT decrypt (SSL Proxying
+    /// not enabled for this host): any captured body is ciphertext, not real
+    /// content. Surfaced so the agent isn't misled into thinking the body was
+    /// simply "not captured".
+    pub tunnel: bool,
     /// Set when the transaction failed/was aborted (chlsj session state).
     pub error: Option<String>,
     pub request: HttpMessage,
@@ -148,6 +153,17 @@ pub(crate) fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> O
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+/// Heuristic guard against a silently-mismatched parse: if we got transactions
+/// but every one has an empty host AND method, the input schema almost
+/// certainly didn't match (serde filled all fields with defaults). Lets callers
+/// turn "parsed garbage, no error" into a clear failure.
+pub fn looks_like_schema_mismatch(txns: &[Transaction]) -> bool {
+    !txns.is_empty()
+        && txns
+            .iter()
+            .all(|t| t.host.is_empty() && t.method.is_empty())
 }
 
 /// Decode standard base64, yielding empty bytes on error (lenient by design).

@@ -243,6 +243,8 @@ impl HarEntry {
             client_addr: None,
             remote_addr: server_ip,
             tls_version: None,
+            // HAR entries are already decrypted; no undecrypted-tunnel concept.
+            tunnel: false,
             error: None,
             request,
             response: parts.message,

@@ -65,37 +65,26 @@ fn decompress(bytes: &[u8], enc: Option<&str>) -> Option<Vec<u8>> {
             if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
                 return None; // already decoded
             }
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(bytes)
-                .read_to_end(&mut out)
-                .ok()?;
-            Some(out)
+            read_capped(flate2::read::GzDecoder::new(bytes))
         }
         "deflate" => {
             // Try zlib-wrapped first, then raw DEFLATE.
-            let mut out = Vec::new();
-            if flate2::read::ZlibDecoder::new(bytes)
-                .read_to_end(&mut out)
-                .is_ok()
-                && !out.is_empty()
-            {
-                return Some(out);
-            }
-            let mut raw = Vec::new();
-            flate2::read::DeflateDecoder::new(bytes)
-                .read_to_end(&mut raw)
-                .ok()?;
-            (!raw.is_empty()).then_some(raw)
+            read_capped(flate2::read::ZlibDecoder::new(bytes))
+                .or_else(|| read_capped(flate2::read::DeflateDecoder::new(bytes)))
         }
-        "br" => {
-            let mut out = Vec::new();
-            brotli::Decompressor::new(bytes, 4096)
-                .read_to_end(&mut out)
-                .ok()?;
-            (!out.is_empty()).then_some(out)
-        }
+        "br" => read_capped(brotli::Decompressor::new(bytes, 4096)),
         _ => None,
     }
+}
+
+/// Cap on decompressed output, to defuse decompression bombs.
+const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
+/// Read a decoder to end, bounded by [`MAX_DECOMPRESSED`]. `None` on error/empty.
+fn read_capped<R: Read>(reader: R) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    reader.take(MAX_DECOMPRESSED).read_to_end(&mut out).ok()?;
+    (!out.is_empty()).then_some(out)
 }
 
 fn is_binary(bytes: &[u8], content_type: Option<&str>) -> bool {

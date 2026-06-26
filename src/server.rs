@@ -6,7 +6,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
@@ -17,9 +17,33 @@ use crate::session::{Body, Session, body, convert};
 use crate::tools::inspect::{self, ListFilters, Matcher};
 use crate::tools::{
     ConfirmReq, ExportReq, GetRequestReq, ListRequestsReq, ReadFileReq, SearchReq, SetToolReq,
-    StatsReq, ThrottlingReq, ToolNameReq,
+    StatsReq, ThrottlingReq, ToolName, ToolNameReq,
 };
 use crate::web::WebClient;
+
+/// Validate a caller-supplied session path: it must be absolute (kills `-`
+/// argv-injection and relative surprises) and end in one of `allowed_exts`
+/// (so an agent can't be steered into reading/overwriting `~/.zshrc`, a plist,
+/// `authorized_keys`, etc.).
+fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, CharlesError> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(CharlesError::InvalidArg(format!(
+            "path must be absolute, got '{path}'"
+        )));
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !allowed_exts.contains(&ext.as_str()) {
+        return Err(CharlesError::InvalidArg(format!(
+            "path must end in one of {allowed_exts:?}, got '{path}'"
+        )));
+    }
+    Ok(p.to_path_buf())
+}
 
 #[derive(Clone)]
 pub struct CharlesServer {
@@ -81,8 +105,11 @@ impl CharlesServer {
     }
 
     #[tool(
-        description = "Enable or disable bandwidth throttling, optionally selecting a preset \
-                       (e.g. 3G, 4G, \"56 kbps Modem\")."
+        description = "Enable or disable bandwidth throttling, optionally selecting a preset. The \
+                       preset must exactly match a name configured in Charles (Proxy → Throttle \
+                       Settings; defaults include \"3G\", \"4G\", \"56 kbps Modem\"). Charles \
+                       silently ignores an unknown preset, and this server can't verify it took \
+                       effect — confirm in the Charles UI if unsure."
     )]
     async fn set_throttling(
         &self,
@@ -100,20 +127,43 @@ impl CharlesServer {
     }
 
     #[tool(
-        description = "Enable or disable a Charles tool: breakpoints, no-caching, block-cookies, \
-                       map-remote, map-local, rewrite, black-list, white-list, dns-spoofing, \
-                       auto-save, client-process."
+        description = "Enable/disable a Charles tool's master switch: breakpoints, no-caching, \
+                       block-cookies, map-remote, map-local, rewrite, black-list, white-list, \
+                       dns-spoofing, auto-save, client-process. NOTE: the rule-based tools \
+                       (map-*, rewrite, *-list, dns-spoofing) do nothing without rules configured \
+                       in the Charles GUI — this server cannot manage rules — and breakpoints will \
+                       pause/hang matching traffic. See the per-call notes."
     )]
     async fn set_tool(
         &self,
         Parameters(req): Parameters<SetToolReq>,
     ) -> Result<CallToolResult, ErrorData> {
         self.web.set_tool(req.tool.to_web(), req.enabled).await?;
-        Ok(Self::ok(format!(
+        let mut msg = format!(
             "Tool {:?} {}.",
             req.tool,
             if req.enabled { "enabled" } else { "disabled" }
-        )))
+        );
+        if req.enabled {
+            match req.tool {
+                ToolName::Breakpoints => msg.push_str(
+                    " ⚠ Charles will now PAUSE matching requests in its GUI waiting for manual \
+                     Edit/Execute/Abort. This server cannot respond to breakpoints, so live \
+                     traffic may hang until you act in Charles or disable this.",
+                ),
+                ToolName::MapRemote
+                | ToolName::MapLocal
+                | ToolName::Rewrite
+                | ToolName::BlackList
+                | ToolName::WhiteList
+                | ToolName::DnsSpoofing => msg.push_str(
+                    " Note: this only affects traffic if matching rules exist (configured in the \
+                     Charles GUI — this server can't add rules). With no rules it's a no-op.",
+                ),
+                _ => {}
+            }
+        }
+        Ok(Self::ok(msg))
     }
 
     #[tool(description = "Report whether a Charles tool is currently enabled or disabled.")]
@@ -138,7 +188,8 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = convert::read_session_file(self.web.config(), Path::new(&req.path)).await?;
+        let path = validate_session_path(&req.path, &["chls", "har", "chlsj"])?;
+        let session = convert::read_session_file(self.web.config(), &path).await?;
         let summaries = session.summaries();
         let table = format::summary_table(&summaries);
         Ok(Self::ok(format!(
@@ -275,8 +326,9 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<ExportReq>,
     ) -> Result<CallToolResult, ErrorData> {
+        let path = validate_session_path(&req.path, &[req.format.ext()])?;
         let bytes = self.web.fetch_session_in_format(req.format.ext()).await?;
-        tokio::fs::write(&req.path, &bytes)
+        tokio::fs::write(&path, &bytes)
             .await
             .map_err(CharlesError::Io)?;
         Ok(Self::ok(format!(
@@ -327,5 +379,22 @@ impl ServerHandler for CharlesServer {
                 .into(),
         );
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_session_path;
+
+    #[test]
+    fn path_must_be_absolute_with_allowed_ext() {
+        // relative path → rejected (also blocks leading-dash argv injection)
+        assert!(validate_session_path("relative.har", &["har"]).is_err());
+        assert!(validate_session_path("-rf.har", &["har"]).is_err());
+        // absolute but disallowed extension → rejected (no overwriting ~/.zshrc)
+        assert!(validate_session_path("/home/u/.zshrc", &["har", "chlsj"]).is_err());
+        // absolute with an allowed extension → ok
+        assert!(validate_session_path("/tmp/s.har", &["har", "chlsj", "chls"]).is_ok());
+        assert!(validate_session_path("/tmp/s.chlsj", &["chlsj"]).is_ok());
     }
 }
