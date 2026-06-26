@@ -1,0 +1,145 @@
+[
+  {
+    "status": "COMPLETE",
+    "scheme": "https",
+    "host": "api.example.com",
+    "actualPort": 443,
+    "path": "/v1/users",
+    "query": "page=1",
+    "method": "GET",
+    "protocolVersion": "HTTP/1.1",
+    "remoteAddress": "203.0.113.10",
+    "clientAddress": "127.0.0.1",
+    "tlsVersion": "TLSv1.3",
+    "times": { "start": "2026-01-15T10:00:00.000Z" },
+    "durations": { "total": 53 },
+    "request": {
+      "header": {
+        "firstLine": "GET /v1/users?page=1 HTTP/1.1",
+        "headers": [
+          { "name": "Host", "value": "api.example.com" },
+          { "name": "Accept", "value": "application/json" }
+        ]
+      }
+    },
+    "response": {
+      "status": 200,
+      "sizes": { "body": 34, "headers": 80 },
+      "header": {
+        "firstLine": "HTTP/1.1 200 OK",
+        "headers": [
+          { "name": "Content-Type", "value": "application/json; charset=utf-8" },
+          { "name": "Set-Cookie", "value": "a=1" },
+          { "name": "Set-Cookie", "value": "b=2" }
+        ]
+      },
+      "body": { "text": "{\"users\":[{\"id\":1,\"name\":\"Ada\"}]}" }
+    }
+  },
+  {
+    "status": "COMPLETE",
+    "scheme": "https",
+    "host": "api.example.com",
+    "actualPort": 443,
+    "path": "/v1/login",
+    "query": "",
+    "method": "POST",
+    "protocolVersion": "HTTP/2",
+    "times": { "start": "2026-01-15T10:00:01.000Z" },
+    "durations": { "total": 120 },
+    "request": {
+      "header": {
+        "firstLine": "POST /v1/login HTTP/2",
+        "headers": [ { "name": "Content-Type", "value": "application/json" } ]
+      },
+      "body": { "text": "{\"user\":\"ada\",\"pass\":\"x\"}" }
+    },
+    "response": {
+      "status": 200,
+      "contentEncoding": "gzip",
+      "sizes": { "body": 60 },
+      "header": {
+        "firstLine": "HTTP/2 200",
+        "headers": [
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Content-Encoding", "value": "gzip" }
+        ]
+      },
+      "body": {
+        "encoding": "base64",
+        "encoded": "H4sIADv6PmoAA6tWyk0tLk5MT1WyUspIzcnJV0ivyiwoSE1RKM8vyklR0lHKU7IyMaoFAC3sCasoAAAA"
+      }
+    }
+  },
+  {
+    "status": "COMPLETE",
+    "scheme": "https",
+    "host": "cdn.example.com",
+    "actualPort": 443,
+    "path": "/img/logo.png",
+    "query": "",
+    "method": "GET",
+    "protocolVersion": "HTTP/1.1",
+    "times": { "start": "2026-01-15T10:00:02.000Z" },
+    "durations": { "total": 12 },
+    "request": {
+      "header": {
+        "firstLine": "GET /img/logo.png HTTP/1.1",
+        "headers": [ { "name": "Accept", "value": "image/png" } ]
+      }
+    },
+    "response": {
+      "status": 200,
+      "sizes": { "body": 20 },
+      "header": {
+        "firstLine": "HTTP/1.1 200 OK",
+        "headers": [ { "name": "Content-Type", "value": "image/png" } ]
+      },
+      "body": { "encoding": "base64", "encoded": "iVBORw0KGgoAAAANSUhEUgAAAAE=" }
+    }
+  },
+  {
+    "status": "FAILED",
+    "scheme": "https",
+    "host": "api.example.com",
+    "actualPort": 443,
+    "path": "/v1/timeout",
+    "query": "",
+    "method": "GET",
+    "protocolVersion": "HTTP/1.1",
+    "times": { "start": "2026-01-15T10:00:03.000Z" },
+    "request": {
+      "header": {
+        "firstLine": "GET /v1/timeout HTTP/1.1",
+        "headers": [ { "name": "Host", "value": "api.example.com" } ]
+      }
+    }
+  },
+  {
+    "status": "COMPLETE",
+    "scheme": "http",
+    "host": "status.other.org",
+    "actualPort": 80,
+    "path": "/health",
+    "query": "",
+    "method": "GET",
+    "protocolVersion": "HTTP/1.1",
+    "times": { "start": "2026-01-15T10:00:04.000Z" },
+    "durations": { "total": 8 },
+    "request": {
+      "header": {
+        "firstLine": "GET /health HTTP/1.1",
+        "headers": [ { "name": "Host", "value": "status.other.org" } ]
+      }
+    },
+    "response": {
+      "status": 503,
+      "sizes": { "body": 11 },
+      "header": {
+        "firstLine": "HTTP/1.1 503 Service Unavailable",
+        "headers": [ { "name": "Content-Type", "value": "text/plain" } ]
+      },
+      "body": { "text": "maintenance" }
+    }
+  }
+]

@@ -1,0 +1,223 @@
+//! Compact, context-frugal rendering of session summaries and details.
+
+use crate::session::{Body, Transaction, TxnSummary};
+use crate::tools::inspect::{SearchHit, Stats};
+
+/// Render a list of summaries as an aligned, compact table.
+pub fn summary_table(rows: &[TxnSummary]) -> String {
+    if rows.is_empty() {
+        return "requests: 0 total (no rows matched the filters)".to_string();
+    }
+    // Column widths (path is truncated to keep rows scannable).
+    const PATH_MAX: usize = 48;
+    const HOST_MAX: usize = 28;
+
+    let host_w = rows
+        .iter()
+        .map(|r| r.host.len().min(HOST_MAX))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:>4}  {:<6} {:>3}  {:<hw$}  {:<pw$}  {:<18} {:>8}  {:>6}\n",
+        "#",
+        "METHOD",
+        "ST",
+        "HOST",
+        "PATH",
+        "MIME",
+        "SIZE",
+        "MS",
+        hw = host_w,
+        pw = PATH_MAX,
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:>4}  {:<6} {:>3}  {:<hw$}  {:<pw$}  {:<18} {:>8}  {:>6}\n",
+            r.index,
+            truncate(&r.method, 6),
+            r.status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+            truncate(&r.host, host_w),
+            truncate(&r.path, PATH_MAX),
+            truncate(r.mime.as_deref().unwrap_or("-"), 18),
+            r.response_size
+                .map(human_size)
+                .unwrap_or_else(|| "-".into()),
+            r.duration_ms
+                .map(|d| format!("{:.0}", d))
+                .unwrap_or_else(|| "-".into()),
+            hw = host_w,
+            pw = PATH_MAX,
+        ));
+    }
+    out
+}
+
+/// Render the full detail of one transaction, including a decoded body.
+pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("#{} {} {}\n", t.index, t.method, t.url));
+    if let Some(p) = &t.protocol {
+        out.push_str(&format!("protocol: {p}\n"));
+    }
+    out.push_str(&format!(
+        "status: {}{}\n",
+        t.status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".into()),
+        t.status_text
+            .as_deref()
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default(),
+    ));
+    if let Some(e) = &t.error {
+        out.push_str(&format!("error: {e}\n"));
+    }
+    if let Some(d) = t.duration_ms {
+        out.push_str(&format!("duration: {d:.0} ms\n"));
+    }
+    if t.client_addr.is_some() || t.remote_addr.is_some() || t.tls_version.is_some() {
+        out.push_str(&format!(
+            "client: {}  remote: {}  tls: {}\n",
+            t.client_addr.as_deref().unwrap_or("-"),
+            t.remote_addr.as_deref().unwrap_or("-"),
+            t.tls_version.as_deref().unwrap_or("-"),
+        ));
+    }
+
+    out.push_str("\n── request ──\n");
+    render_headers(&mut out, &t.request.headers);
+    out.push_str("\nbody:\n");
+    render_body(&mut out, req_body);
+
+    out.push_str("\n── response ──\n");
+    match &t.response {
+        Some(resp) => {
+            render_headers(&mut out, &resp.headers);
+            out.push_str("\nbody:\n");
+            render_body(&mut out, resp_body);
+        }
+        None => out.push_str("(no response captured)\n"),
+    }
+    out
+}
+
+fn render_headers(out: &mut String, headers: &[(String, String)]) {
+    if headers.is_empty() {
+        out.push_str("(no headers)\n");
+        return;
+    }
+    for (k, v) in headers {
+        out.push_str(&format!("{k}: {v}\n"));
+    }
+}
+
+fn render_body(out: &mut String, body: &Body) {
+    match body {
+        Body::Empty => out.push_str("(empty)\n"),
+        Body::NotCaptured => out.push_str("(not captured)\n"),
+        Body::Text {
+            text,
+            charset,
+            truncated,
+            original_len,
+        } => {
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+            if *truncated {
+                out.push_str(&format!(
+                    "… [truncated: {} of {} bytes, charset {}; raise max_body_bytes for more]\n",
+                    text.len(),
+                    original_len,
+                    charset,
+                ));
+            }
+        }
+        Body::Binary {
+            bytes_len,
+            sample_hex,
+            truncated,
+        } => {
+            out.push_str(&format!(
+                "(binary, {} bytes) first bytes: {}{}\n",
+                bytes_len,
+                sample_hex,
+                if *truncated { "…" } else { "" },
+            ));
+        }
+    }
+}
+
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes}{}", UNITS[0])
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Render search hits compactly: one line per hit with index, field, snippet.
+pub fn search_results(hits: &[SearchHit]) -> String {
+    if hits.is_empty() {
+        return "0 hits (no rows matched the query)".to_string();
+    }
+    let mut out = String::new();
+    for h in hits {
+        out.push_str(&format!("#{:<4} [{}] {}\n", h.index, h.field, h.snippet));
+    }
+    out
+}
+
+/// Render aggregate session statistics.
+pub fn stats_report(s: &Stats) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} transactions, {} error(s), {} total response bytes\n",
+        s.total,
+        s.errors,
+        human_size(s.total_response_bytes),
+    ));
+
+    let section = |out: &mut String, title: &str, rows: &[(String, usize)], max: usize| {
+        out.push_str(&format!("\n{title}:\n"));
+        if rows.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for (k, n) in rows.iter().take(max) {
+            out.push_str(&format!("  {n:>5}  {k}\n"));
+        }
+    };
+    section(&mut out, "by host", &s.by_host, 15);
+    section(&mut out, "by status", &s.by_status, 15);
+    section(&mut out, "by mime", &s.by_mime, 15);
+
+    if !s.slowest.is_empty() {
+        out.push_str("\nslowest:\n");
+        for (idx, url, ms) in &s.slowest {
+            out.push_str(&format!("  {ms:>7.0} ms  #{idx}  {}\n", truncate(url, 70)));
+        }
+    }
+    out
+}

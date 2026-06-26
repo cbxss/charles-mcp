@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<!--
+  PROVISIONAL FIXTURE — NOT a verified capture of a real Charles control page.
+  Hand-authored to exercise web::discovery against a plausible layout. Replace
+  with a real http://control.charles/ capture once Charles 5 is available, then
+  re-run tests/discovery.rs to lock the true endpoint paths.
+-->
+<html>
+  <head><title>Charles Web Interface</title></head>
+  <body>
+    <h1>Charles</h1>
+
+    <section id="recording">
+      <h2>Recording</h2>
+      <a href="/recording/start">Start Recording</a>
+      <a href="/recording/stop">Stop Recording</a>
+    </section>
+
+    <section id="throttling">
+      <h2>Throttling</h2>
+      <form action="/throttling/activate" method="get">
+        <select name="preset">
+          <option value="56+kbps+Modem">56 kbps Modem</option>
+          <option value="3G">3G</option>
+          <option value="4G">4G</option>
+        </select>
+        <input type="submit" value="Activate Throttling" />
+      </form>
+      <a href="/throttling/deactivate">Deactivate Throttling</a>
+    </section>
+
+    <section id="tools">
+      <h2>Tools</h2>
+      <a href="/tools/breakpoints/enable">Enable Breakpoints</a>
+      <a href="/tools/breakpoints/disable">Disable Breakpoints</a>
+      <a href="/tools/map-local/enable">Enable Map Local</a>
+      <a href="/tools/rewrite/disable">Disable Rewrite</a>
+    </section>
+
+    <section id="session">
+      <h2>Session</h2>
+
+      <form action="/session/export-session" method="post">
+        <label>Format:
+          <select name="format">
+            <option value="chlsj">Charles JSON Session (.chlsj)</option>
+            <option value="har">HTTP Archive (.har)</option>
+            <option value="xml">XML (.xml)</option>
+            <option value="csv">CSV (.csv)</option>
+          </select>
+        </label>
+        <input type="submit" value="Export Session" />
+      </form>
+
+      <a href="/session/download-session">Download Session (native .chls)</a>
+
+      <form action="/session/clear-session" method="post">
+        <input type="submit" value="Clear Session" />
+      </form>
+    </section>
+
+    <section id="application">
+      <h2>Application</h2>
+      <a href="/quit">Quit Charles</a>
+    </section>
+  </body>
+</html>
