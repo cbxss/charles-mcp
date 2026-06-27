@@ -5,8 +5,15 @@ An [MCP](https://modelcontextprotocol.io) server (Rust) that lets an AI agent dr
 ## Setup
 
 1. In Charles: enable **Proxy → Web Interface Settings**.
-2. `cargo build --release` — bundles SQLite, so a C compiler must be present.
-3. `claude mcp add charles -- "$(pwd)/target/release/charles-mcp"` (or point your MCP client at the binary).
+2. Install the prebuilt binary (macOS arm64/intel, Linux x64):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/cbxss/charles-mcp/main/install.sh | sh
+   ```
+   …or build from source: `cargo build --release` (bundles SQLite, needs a C compiler).
+3. Register it with your MCP client:
+   ```bash
+   claude mcp add charles -- ~/.local/bin/charles-mcp
+   ```
 
 Defaults assume Charles on `127.0.0.1:8888`. Run **`charles_status`** first. No Charles? Point `read_session_file` at a saved `.har` / `.chlsj` / `.chls`.
 
