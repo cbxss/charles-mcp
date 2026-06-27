@@ -1,24 +1,14 @@
-//! Lazy decoding of a captured [`RawBody`] into a presentable [`Body`].
-//!
-//! Pipeline: (base64 already unwrapped at parse time) → content-encoding
-//! decompress (with an already-decoded guard) → charset decode → binary
-//! detection / JSON pretty-print / truncation.
-
 use std::io::Read;
 
 use super::{Body, RawBody, charset_from_content_type, grpc, protobuf};
 
-/// Options threaded into [`decode_with`] for named protobuf decoding.
 #[derive(Default, Clone, Copy)]
 pub struct DecodeOptions<'a> {
-    /// Loaded `.proto` descriptors for named decode, if any.
     #[cfg(feature = "proto")]
     pub pool: Option<&'a protobuf::ProtoPool>,
-    /// Fully-qualified message type to decode against (named).
     pub proto_type: Option<&'a str>,
 }
 
-/// Decode a captured body (schemaless protobuf included; no `.proto` needed).
 pub fn decode(raw: &RawBody, max_bytes: usize) -> Body {
     decode_with(raw, max_bytes, &DecodeOptions::default())
 }
@@ -34,8 +24,6 @@ pub fn decode_with(raw: &RawBody, max_bytes: usize, opts: &DecodeOptions) -> Bod
     let decompressed = decompress(&raw.bytes, raw.content_encoding.as_deref());
     let bytes: &[u8] = decompressed.as_deref().unwrap_or(&raw.bytes);
 
-    // Protobuf / gRPC decode, before the generic binary path. On any failure we
-    // fall through to the existing is_binary → Binary(hex) handling.
     if let Some(ct) = raw.content_type.as_deref() {
         let ctl = ct.to_ascii_lowercase();
         if (grpc::is_grpc_ct(&ctl) || grpc::is_protobuf_ct(&ctl))
@@ -80,9 +68,6 @@ pub fn decode_with(raw: &RawBody, max_bytes: usize, opts: &DecodeOptions) -> Bod
     }
 }
 
-/// Orchestrate protobuf/gRPC decoding: split gRPC frames (or treat the whole
-/// body as one bare-protobuf message), decode each via `protobuf::try_decode`,
-/// and join into a `Body::Protobuf`. `None` ⇒ caller falls back to hex.
 fn decode_protobuf(
     bytes: &[u8],
     raw: &RawBody,
@@ -95,7 +80,7 @@ fn decode_protobuf(
         let mut out = Vec::new();
         for f in &frames {
             if f.flags & 0x80 != 0 {
-                continue; // gRPC-Web trailers frame — not protobuf
+                continue;
             }
             out.push(
                 grpc::decompress_frame(f, raw.grpc_encoding.as_deref())
@@ -139,33 +124,24 @@ fn decode_protobuf(
     })
 }
 
-/// Decompress per `Content-Encoding`. Returns `None` when no decompression is
-/// needed/possible — including the *already-decoded guard*: if the encoding
-/// claims gzip but the bytes lack the gzip magic, assume Charles already
-/// decoded it and leave the bytes untouched.
 fn decompress(bytes: &[u8], enc: Option<&str>) -> Option<Vec<u8>> {
     let enc = enc?.trim().to_ascii_lowercase();
     match enc.as_str() {
         "gzip" | "x-gzip" => {
             if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
-                return None; // already decoded
+                return None;
             }
             read_capped(flate2::read::GzDecoder::new(bytes))
         }
-        "deflate" => {
-            // Try zlib-wrapped first, then raw DEFLATE.
-            read_capped(flate2::read::ZlibDecoder::new(bytes))
-                .or_else(|| read_capped(flate2::read::DeflateDecoder::new(bytes)))
-        }
+        "deflate" => read_capped(flate2::read::ZlibDecoder::new(bytes))
+            .or_else(|| read_capped(flate2::read::DeflateDecoder::new(bytes))),
         "br" => read_capped(brotli::Decompressor::new(bytes, 4096)),
         _ => None,
     }
 }
 
-/// Cap on decompressed output, to defuse decompression bombs.
 const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
-/// Read a decoder to end, bounded by [`MAX_DECOMPRESSED`]. `None` on error/empty.
 fn read_capped<R: Read>(reader: R) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     reader.take(MAX_DECOMPRESSED).read_to_end(&mut out).ok()?;
@@ -185,7 +161,6 @@ fn is_binary(bytes: &[u8], content_type: Option<&str>) -> bool {
             return true;
         }
     }
-    // Unknown content-type: sniff a prefix for UTF-8 validity.
     let sample = &bytes[..bytes.len().min(2048)];
     std::str::from_utf8(sample).is_err()
 }
@@ -230,7 +205,6 @@ fn maybe_pretty_json(text: &str, content_type: Option<&str>) -> String {
     text.to_string()
 }
 
-/// Truncate a string to at most `max_bytes`, respecting char boundaries.
 fn truncate_str(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();

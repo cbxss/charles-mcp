@@ -1,5 +1,3 @@
-//! Parser for HAR 1.2 (`.har`) files into the unified [`Transaction`] model.
-
 use serde::Deserialize;
 
 use super::{
@@ -111,7 +109,6 @@ fn non_negative(v: Option<i64>) -> Option<u64> {
     v.filter(|n| *n >= 0).map(|n| n as u64)
 }
 
-/// Build the request-side HttpMessage from HAR request headers + body.
 fn build_request(headers: Vec<HarHeader>, post_data: Option<HarPostData>) -> HttpMessage {
     let headers = headers_vec(headers);
     let mut message = HttpMessage {
@@ -136,7 +133,6 @@ fn build_request(headers: Vec<HarHeader>, post_data: Option<HarPostData>) -> Htt
     message
 }
 
-/// The response-derived fields of a transaction.
 #[derive(Default)]
 struct ResponseParts {
     message: Option<HttpMessage>,
@@ -170,7 +166,6 @@ fn build_response(resp: HarResponse) -> ResponseParts {
                 raw.captured = !t.is_empty();
                 raw.bytes = t.into_bytes();
             }
-            // Body not stored by the recorder.
             (None, _) => raw.captured = false,
         }
         raw.declared_charset = charset_from_content_type(ct.as_deref());
@@ -212,8 +207,6 @@ impl HarEntry {
         let (scheme, host, path) = split_url(&url);
         let request = build_request(headers, post_data);
 
-        // Drop a fabricated response when the recorder captured nothing (status 0,
-        // no body) so the detail view matches the chlsj parser's `None`.
         let parts = match response {
             Some(r)
                 if r.status == 0 && r.content.as_ref().and_then(|c| c.text.as_ref()).is_none() =>
@@ -244,7 +237,6 @@ impl HarEntry {
             client_addr: None,
             remote_addr: server_ip,
             tls_version: None,
-            // HAR entries are already decrypted; no undecrypted-tunnel concept.
             tunnel: false,
             error: None,
             request,
@@ -254,7 +246,6 @@ impl HarEntry {
     }
 }
 
-/// Split an absolute URL into (scheme, host, path-with-query).
 pub(crate) fn split_url(raw: &str) -> (String, String, String) {
     match url::Url::parse(raw) {
         Ok(u) => {

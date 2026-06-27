@@ -1,13 +1,3 @@
-//! Parser for Charles JSON session files (`.chlsj`) into the unified model.
-//!
-//! Schema confirmed against Charles output and the community Fiddler importer:
-//! the top level is a JSON array; each element has `host`/`scheme`/`path`/
-//! `query`/`method`/`protocolVersion` and `request`/`response` objects. The
-//! HTTP status code lives at `response.status`; the top-level `status` is the
-//! session *state* (e.g. COMPLETE/FAILED). Bodies are `body.text` (decoded) or
-//! `body.encoded` (base64), with `contentEncoding` (gzip/brotli) as a sibling.
-//! Parsing is deliberately tolerant: every field is optional with defaults.
-
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -17,9 +7,6 @@ use super::{
 };
 use crate::error::CharlesError;
 
-/// Charles writes `-1` as a "not set" sentinel for many numeric fields. Map any
-/// negative value (or null) to `None` instead of failing the strict unsigned
-/// parse (`invalid value: integer -1, expected u32`).
 fn lenient_unsigned<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -57,17 +44,14 @@ struct ChlsTxn {
     method: Option<String>,
     #[serde(default, rename = "protocolVersion")]
     protocol_version: Option<String>,
-    /// Session state (COMPLETE / FAILED / ...), not the HTTP status.
     #[serde(default)]
     status: Option<String>,
     #[serde(default, rename = "remoteAddress")]
     remote_address: Option<String>,
     #[serde(default, rename = "clientAddress")]
     client_address: Option<String>,
-    /// TLS info lives under `ssl: { protocol }` in real Charles output.
     #[serde(default)]
     ssl: Option<ChlsSsl>,
-    /// Human-readable failure message (e.g. "SSL handshake with client failed…").
     #[serde(default, rename = "errorMessage")]
     error_message: Option<String>,
     #[serde(default)]
@@ -78,12 +62,8 @@ struct ChlsTxn {
     request: Option<ChlsMessage>,
     #[serde(default)]
     response: Option<ChlsMessage>,
-    /// True when Charles only saw an undecrypted HTTPS CONNECT tunnel (SSL
-    /// Proxying not enabled for the host) — the body is ciphertext.
     #[serde(default)]
     tunnel: bool,
-    /// True when this is a WebSocket connection; frames are the request/response
-    /// bodies (raw RFC 6455, base64).
     #[serde(default, rename = "webSocket")]
     web_socket: bool,
 }
@@ -96,7 +76,6 @@ struct ChlsSsl {
 
 #[derive(Deserialize, Default)]
 struct ChlsMessage {
-    /// HTTP status code (present on the response side).
     #[serde(default, deserialize_with = "lenient_unsigned")]
     status: Option<u16>,
     #[serde(default)]
@@ -107,7 +86,6 @@ struct ChlsMessage {
     sizes: Option<ChlsSizes>,
     #[serde(default, rename = "contentEncoding")]
     content_encoding: Option<String>,
-    /// Some Charles versions put the MIME/charset on the message, not the body.
     #[serde(default, rename = "mimeType")]
     mime_type: Option<String>,
     #[serde(default)]
@@ -148,7 +126,6 @@ struct ChlsSizes {
     body: Option<u64>,
 }
 
-/// Charles uses `brotli`; HTTP/our decoder expects `br`.
 fn normalize_encoding(e: Option<String>) -> Option<String> {
     e.map(|s| match s.to_ascii_lowercase().as_str() {
         "brotli" => "br".to_string(),
@@ -158,7 +135,6 @@ fn normalize_encoding(e: Option<String>) -> Option<String> {
 }
 
 impl ChlsMessage {
-    /// Build an HttpMessage; returns (message, mime, body_size).
     fn into_http(self) -> (HttpMessage, Option<String>, Option<u64>) {
         let headers: Vec<(String, String)> = self
             .header
@@ -167,8 +143,6 @@ impl ChlsMessage {
 
         let ct_header = header_value(&headers, "content-type").map(str::to_string);
         let header_ce = header_value(&headers, "content-encoding").map(str::to_string);
-        // MIME/charset can live on the header, the message, or the body
-        // depending on Charles version — try all three.
         let msg_mime = self.mime_type.clone();
         let msg_charset = self.charset.clone();
 
@@ -204,12 +178,10 @@ impl ChlsMessage {
                     raw.captured = true;
                 }
                 (_, Some(text)) => {
-                    // text is already decoded/decompressed.
                     raw.captured = !text.is_empty();
                     raw.bytes = text.into_bytes();
                     raw.content_encoding = None;
                 }
-                // Neither an encoded nor a text body was stored.
                 _ => raw.captured = false,
             }
         } else {
@@ -258,7 +230,6 @@ impl ChlsTxn {
             msg
         });
 
-        // Prefer Charles's human-readable errorMessage; fall back to the state.
         let error = self.error_message.clone().or_else(|| {
             self.status
                 .as_deref()
@@ -266,13 +237,8 @@ impl ChlsTxn {
                 .map(str::to_string)
         });
 
-        // On a failed connection (e.g. SSL handshake refused) there is no real
-        // HTTP exchange — Charles defaults response.status to 200. Drop it so the
-        // error is the story, not a misleading "200".
         let status = if error.is_some() { None } else { status };
 
-        // For a WebSocket connection the request/response bodies are the raw
-        // RFC 6455 frame streams (sent = masked, received = unmasked).
         let websocket = self.web_socket.then(|| {
             let mut msgs = websocket::parse_messages(&request.raw.bytes, WsDirection::Sent);
             if let Some(resp) = &response {
@@ -315,8 +281,6 @@ impl ChlsTxn {
 }
 
 fn is_failed_state(s: &str) -> bool {
-    // Charles's real failure state is EXCEPTION; the rest are defensive in case
-    // a version uses different wording. (COMPLETE/SUCCESS/RECEIVING_* are fine.)
     let s = s.to_ascii_uppercase();
     s.contains("EXCEPTION")
         || s.contains("FAIL")
@@ -333,7 +297,6 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
     })
 }
 
-/// Parse the `start` field of a chlsj `times` object (ISO-8601 or epoch).
 fn parse_time_start(times: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let start = times.get("start")?;
     match start {
@@ -359,7 +322,6 @@ mod tests {
 
     #[test]
     fn tolerates_minus_one_sentinels() {
-        // Charles emits -1 for "not set" on actualPort/port/status/sizes.
         let json = br#"[
           {
             "host": "example.com",
@@ -380,7 +342,6 @@ mod tests {
         let txns = parse(json).expect("must parse despite -1 sentinels");
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].host, "example.com");
-        // -1 status maps to None (no misleading status).
         assert_eq!(txns[0].status, None);
     }
 
@@ -395,7 +356,6 @@ mod tests {
         ]"#;
         let txns = parse(json).expect("parse");
         assert_eq!(txns[0].status, Some(201));
-        // Non-default port appears in the URL.
         assert!(txns[0].url.contains(":8443"), "url was {}", txns[0].url);
     }
 }

@@ -1,12 +1,6 @@
-//! Documented `control.charles` control verbs (recording, throttling, tools).
-//!
-//! These are the stable, publicly-known endpoints. Each is an HTTP GET whose
-//! success we infer from a 2xx response.
-
 use super::WebClient;
 use crate::error::CharlesError;
 
-/// The toggleable Charles tools, with their Web Interface path segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharlesTool {
     Breakpoints,
@@ -23,7 +17,6 @@ pub enum CharlesTool {
 }
 
 impl CharlesTool {
-    /// Path segment Charles uses under `/tools/<segment>/`.
     pub fn segment(self) -> &'static str {
         match self {
             CharlesTool::Breakpoints => "breakpoints",
@@ -50,7 +43,6 @@ impl WebClient {
         self.get_control_text("recording/stop").await.map(drop)
     }
 
-    /// Enable (optionally with a preset) or disable bandwidth throttling.
     pub async fn set_throttling(
         &self,
         enabled: bool,
@@ -59,7 +51,6 @@ impl WebClient {
         let path = if enabled {
             match preset {
                 Some(p) => {
-                    // form-urlencoding matches Charles's `?preset=56+kbps+Modem`.
                     let q = url::form_urlencoded::Serializer::new(String::new())
                         .append_pair("preset", p)
                         .finish();
@@ -80,14 +71,10 @@ impl WebClient {
             .map(drop)
     }
 
-    /// Returns true if the tool reports as enabled, parsed from the status HTML.
     pub async fn get_tool_status(&self, tool: CharlesTool) -> Result<bool, CharlesError> {
         let html = self
             .get_control_text(&format!("tools/{}/", tool.segment()))
             .await?;
-        // The page renders "Status: Enabled" / "Status: Disabled". Parse that
-        // specific marker rather than scanning the whole page (which would trip
-        // on the words "enable"/"disable" in action links or prose).
         let low = html.to_lowercase();
         let after = low
             .split_once("status:")

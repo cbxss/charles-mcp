@@ -1,10 +1,7 @@
-//! Error type shared across the crate, with a mapping into the MCP wire error.
-
 use std::path::PathBuf;
 
 use rmcp::ErrorData;
 
-/// Everything that can go wrong talking to Charles or parsing a session.
 #[derive(Debug, thiserror::Error)]
 pub enum CharlesError {
     #[error(
@@ -69,7 +66,6 @@ impl From<CharlesError> for ErrorData {
     fn from(e: CharlesError) -> Self {
         use CharlesError::*;
         match e {
-            // Things the caller can fix by changing input/config/connection.
             Unreachable { .. }
             | Unauthorized
             | HttpStatus { .. }
@@ -77,7 +73,6 @@ impl From<CharlesError> for ErrorData {
             | CharlesBinMissing(_)
             | InvalidArg(_)
             | UnknownFormat => ErrorData::invalid_request(e.to_string(), None),
-            // Internal/unexpected failures.
             ConvertFailed(_) | Parse(_) | Io(_) | Http(_) | Json(_) | Sqlite(_) => {
                 ErrorData::internal_error(e.to_string(), None)
             }

@@ -1,9 +1,3 @@
-//! HTTP client for the Charles Web Interface.
-//!
-//! The Web Interface is reached by making requests *through* the Charles HTTP
-//! proxy to the magic host `control.charles`. Charles resolves that host
-//! internally, so the client routes every request via the configured proxy.
-
 pub mod control;
 pub mod discovery;
 pub mod live;
@@ -19,19 +13,14 @@ use crate::error::CharlesError;
 use crate::session::Session;
 use crate::web::discovery::DiscoveredEndpoints;
 
-/// A thin, cloneable client over the Charles Web Interface.
 #[derive(Clone)]
 pub struct WebClient {
     cfg: Arc<Config>,
     http: Client,
-    /// Cached result of parsing the control page (cleared on failure).
     discovery: Arc<Mutex<Option<DiscoveredEndpoints>>>,
-    /// Cached live session within the configured TTL, to avoid re-exporting
-    /// Charles on every inspect call.
     live_cache: Arc<Mutex<Option<(Instant, Session)>>>,
 }
 
-/// Outcome of a connectivity probe, surfaced by the `charles_status` tool.
 #[derive(Debug, Clone)]
 pub struct StatusReport {
     pub proxy: String,
@@ -47,8 +36,6 @@ impl WebClient {
         let proxy = reqwest::Proxy::all(cfg.proxy_url())?;
         let http = Client::builder()
             .proxy(proxy)
-            // control.charles is not DNS-resolvable; it only exists inside the
-            // proxy, so we must NOT add a no_proxy exception for it.
             .timeout(cfg.timeout())
             .build()?;
         Ok(Self {
@@ -63,14 +50,11 @@ impl WebClient {
         &self.cfg
     }
 
-    /// GET a `control.charles` path, returning the response body text on 2xx.
     pub async fn get_control_text(&self, path: &str) -> Result<String, CharlesError> {
         let resp = self.send_control(path).await?;
         Ok(resp.text().await?)
     }
 
-    /// GET a `control.charles` path, returning status + raw bytes (no 2xx check).
-    /// Used by the session-download path where 404 is an expected probe result.
     pub async fn get_control_bytes(
         &self,
         path: &str,
@@ -86,7 +70,6 @@ impl WebClient {
         Ok((status, bytes.to_vec()))
     }
 
-    /// GET a `control.charles` path and validate the status, returning the response.
     async fn send_control(&self, path: &str) -> Result<reqwest::Response, CharlesError> {
         let url = self.cfg.control_url(path);
         let mut req = self.http.get(&url);
@@ -114,7 +97,6 @@ impl WebClient {
         }
     }
 
-    /// Probe the Web Interface and classify the result for `charles_status`.
     pub async fn status(&self) -> StatusReport {
         let charles_bin_present = self.cfg.charles_bin.exists();
         let base = StatusReport {
@@ -127,8 +109,6 @@ impl WebClient {
         };
         match self.get_control_text("").await {
             Ok(_) => {
-                // A 200 with no credentials sent means the Web Interface allows
-                // anonymous access — not that we authenticated.
                 let authed = self.cfg.web_user.is_some();
                 StatusReport {
                     reachable: true,

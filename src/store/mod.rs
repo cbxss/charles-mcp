@@ -1,16 +1,3 @@
-//! SQLite traffic store: ingest a parsed [`Session`] once, query it many times.
-//!
-//! The store is the index/cache behind the inspect tools. `list`/`stats`/`search`
-//! run as SQL/FTS over the summary columns (never touching bodies), while
-//! `get`/`get_all` reconstruct full [`Transaction`]s for one entry on demand so
-//! the existing lazy decoder (gzip/brotli/protobuf/gRPC/WebSocket) stays the
-//! single source of truth. Bodies are content-addressed (sha256) so identical
-//! payloads — the repeated JS/JSON/images that dominate real captures — dedup.
-//!
-//! All access is serialized through a single connection behind a `Mutex`; the
-//! server wraps each call in `spawn_blocking`, so the blocking SQLite calls here
-//! never run on the async runtime.
-
 pub mod schema;
 
 use std::path::Path;
@@ -27,7 +14,6 @@ use crate::session::{
     HttpMessage, RawBody, Session, Transaction, TxnSummary, WsDirection, WsMessage, WsOpcode, body,
 };
 
-/// A handle to one ingested capture (live snapshot or file).
 #[derive(Debug, Clone)]
 pub struct CaptureRef {
     pub capture_id: String,
@@ -35,7 +21,6 @@ pub struct CaptureRef {
     pub entry_count: usize,
 }
 
-/// One browse/list row (summary columns + the resource-class tag and priority).
 #[derive(Debug, Clone)]
 pub struct EntryRow {
     pub seq: usize,
@@ -51,7 +36,6 @@ pub struct EntryRow {
 }
 
 impl EntryRow {
-    /// A bodyless summary for reuse of the existing table formatter.
     pub fn summary(&self) -> TxnSummary {
         TxnSummary {
             index: self.seq,
@@ -66,7 +50,6 @@ impl EntryRow {
     }
 }
 
-/// Owned (Send) filters for `list`, safe to move into `spawn_blocking`.
 #[derive(Debug, Default)]
 pub struct StoreFilters {
     pub host: Option<String>,
@@ -75,7 +58,6 @@ pub struct StoreFilters {
     pub mime: Option<String>,
     pub resource_class: Option<String>,
     pub min_priority: Option<i64>,
-    /// Applied in Rust (SQLite has no regex): matches against the path+query.
     pub path_regex: Option<Regex>,
     pub limit: usize,
 }
@@ -85,8 +67,6 @@ pub struct TrafficStore {
 }
 
 impl TrafficStore {
-    /// Open the store. `None` → an ephemeral in-memory DB (gone on exit);
-    /// `Some(path)` → a persistent DB (created if absent).
     pub fn open(path: Option<&Path>) -> Result<Self, CharlesError> {
         let conn = match path {
             Some(p) => Connection::open(p)?,
@@ -99,13 +79,9 @@ impl TrafficStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        // Recover from a poisoned lock rather than panicking forever: the store
-        // is a rebuildable cache, so a single panicking op must not brick every
-        // subsequent call for the process lifetime.
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Look up a capture by its `source_key` (`path:mtime:size` for files).
     pub fn capture_by_source_key(
         &self,
         source_key: &str,
@@ -127,7 +103,6 @@ impl TrafficStore {
         Ok(row)
     }
 
-    /// Bump a capture's `last_used` timestamp (for LRU eviction of file captures).
     pub fn touch(&self, capture_id: &str) -> Result<(), CharlesError> {
         let conn = self.lock();
         conn.execute(
@@ -137,10 +112,6 @@ impl TrafficStore {
         Ok(())
     }
 
-    /// Replace a capture's contents wholesale (each ingest is a full snapshot —
-    /// merging would silently drop legitimately-repeated requests). Bumps the
-    /// capture's `generation`. `fts_cap` bounds the decoded text indexed per
-    /// message for full-text search.
     pub fn ingest(
         &self,
         capture_id: &str,
@@ -154,7 +125,6 @@ impl TrafficStore {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
 
-        // Preserve created_at across re-ingest; bump the generation.
         let prev: Option<(i64, String)> = tx
             .query_row(
                 "SELECT generation, created_at FROM captures WHERE capture_id = ?1",
@@ -165,8 +135,6 @@ impl TrafficStore {
         let new_gen = prev.as_ref().map(|(g, _)| g + 1).unwrap_or(0);
         let created_at = prev.map(|(_, c)| c).unwrap_or_else(|| now.clone());
 
-        // Drop the prior snapshot (FTS rows keyed by entries.rowid first, then
-        // entries — ws_frames cascade via the FK).
         tx.execute(
             "DELETE FROM entries_fts WHERE rowid IN (SELECT rowid FROM entries WHERE capture_id = ?1)",
             params![capture_id],
@@ -188,7 +156,6 @@ impl TrafficStore {
             ingest_entry(&tx, capture_id, seq, t, fts_cap)?;
         }
 
-        // Reclaim bodies no longer referenced by any entry or frame.
         tx.execute(
             "DELETE FROM bodies WHERE sha256 NOT IN (
                SELECT req_body_sha  FROM entries   WHERE req_body_sha  IS NOT NULL
@@ -205,8 +172,6 @@ impl TrafficStore {
         })
     }
 
-    /// List/browse entries (summary columns only), ordered by priority then seq.
-    /// Returns the (possibly limited) rows and the total match count.
     pub fn list(
         &self,
         capture_id: &str,
@@ -264,7 +229,6 @@ impl TrafficStore {
         Ok((out, total))
     }
 
-    /// Aggregate statistics for a capture, built entirely in SQL.
     pub fn stats(&self, capture_id: &str) -> Result<crate::tools::inspect::Stats, CharlesError> {
         let conn = self.lock();
         let cid = params![capture_id];
@@ -329,7 +293,6 @@ impl TrafficStore {
         })
     }
 
-    /// Full-text search via FTS5 (ranked by bm25). Returns hits as (seq, snippet).
     pub fn search_fts(
         &self,
         capture_id: &str,
@@ -355,15 +318,11 @@ impl TrafficStore {
         rows.map(|r| r.map_err(CharlesError::from)).collect()
     }
 
-    /// Reconstruct one full [`Transaction`] (headers + bodies + WS frames) by its
-    /// position (`seq`) in the capture, for `get_request` / replay.
     pub fn get(&self, capture_id: &str, seq: usize) -> Result<Option<Transaction>, CharlesError> {
         let conn = self.lock();
         load_transaction(&conn, capture_id, seq)
     }
 
-    /// Reconstruct every transaction in a capture (used by the regex search
-    /// fallback, which must scan decoded bodies). Ordered by seq.
     pub fn get_all(&self, capture_id: &str) -> Result<Vec<Transaction>, CharlesError> {
         let conn = self.lock();
         let seqs: Vec<usize> = {
@@ -381,14 +340,9 @@ impl TrafficStore {
         Ok(out)
     }
 
-    /// Evict least-recently-used FILE captures beyond `keep` (live is untouched).
     pub fn evict_file_captures(&self, keep: usize) -> Result<(), CharlesError> {
-        // Always retain at least the most-recently-used file capture — otherwise
-        // `--store-max-captures 0` would evict the capture we just ingested
-        // (newest last_used) before the caller could query it.
         let keep = keep.max(1);
         let conn = self.lock();
-        // Capture ids to drop: file captures sorted oldest-first, skipping `keep`.
         let victims: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT capture_id FROM captures WHERE kind='file' ORDER BY last_used DESC LIMIT -1 OFFSET ?1",
@@ -405,7 +359,6 @@ impl TrafficStore {
         Ok(())
     }
 
-    /// Number of entries in a capture (a cheap COUNT, no row materialization).
     pub fn entry_count(&self, capture_id: &str) -> Result<usize, CharlesError> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
@@ -416,31 +369,21 @@ impl TrafficStore {
         Ok(n as usize)
     }
 
-    /// Drop everything and reclaim space.
     pub fn reset(&self) -> Result<(), CharlesError> {
         let conn = self.lock();
         conn.execute("DELETE FROM entries_fts", [])?;
         conn.execute("DELETE FROM entries", [])?;
         conn.execute("DELETE FROM bodies", [])?;
         conn.execute("DELETE FROM captures", [])?;
-        // Best-effort space reclaim (a no-op unless auto_vacuum=INCREMENTAL took).
         let _ = conn.execute("PRAGMA incremental_vacuum", []);
         Ok(())
     }
 }
 
-// ---- free helpers (operate on a borrowed connection / transaction) ----------
-
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Content-addressing key for a body: the sha256 of the bytes AND the
-/// content-dependent metadata stored alongside them (type/encoding/charset).
-/// Folding the metadata in means two byte-identical bodies that differ in, say,
-/// `application/json` vs `text/plain` get distinct rows — otherwise the first
-/// writer's metadata would win and later entries would decode with the wrong
-/// type. Truly-identical bodies (the repeated assets) still dedup to one row.
 fn body_key(raw: &RawBody) -> String {
     let mut h = Sha256::new();
     h.update(&raw.bytes);
@@ -450,7 +393,7 @@ fn body_key(raw: &RawBody) -> String {
         raw.grpc_encoding.as_deref(),
         raw.declared_charset.as_deref(),
     ] {
-        h.update([0u8]); // domain separator between bytes/fields
+        h.update([0u8]);
         h.update(field.unwrap_or("").as_bytes());
     }
     h.update([raw.was_base64_wrapped as u8]);
@@ -484,7 +427,6 @@ fn group_count(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Content-address and upsert a captured body; returns its sha (None if absent).
 fn store_body(
     tx: &rusqlite::Transaction<'_>,
     raw: &RawBody,
@@ -578,7 +520,6 @@ fn ingest_entry(
     )?;
     let rowid = tx.last_insert_rowid();
 
-    // WebSocket frames out-of-row (a connection can carry thousands).
     if let Some(frames) = &t.websocket {
         for (fseq, m) in frames.iter().enumerate() {
             let body_sha = store_body(tx, &m.payload)?;
@@ -589,7 +530,6 @@ fn ingest_entry(
         }
     }
 
-    // FTS row: url + headers + the decode-once body preview (incl. protobuf tree).
     let (headers_text, body_text) = fts_text(t, fts_cap);
     tx.execute(
         "INSERT INTO entries_fts (rowid, url, headers, body_text) VALUES (?1,?2,?3,?4)",
@@ -598,8 +538,6 @@ fn ingest_entry(
     Ok(())
 }
 
-/// Build the searchable text for one transaction: joined header lines and the
-/// decoded request+response bodies (text or protobuf tree), each capped.
 fn fts_text(t: &Transaction, cap: usize) -> (String, String) {
     let mut headers = String::new();
     for (k, v) in &t.request.headers {
@@ -768,8 +706,6 @@ fn parse_headers(json: &str) -> Result<Vec<(String, String)>, CharlesError> {
     Ok(serde_json::from_str(json)?)
 }
 
-/// Rebuild a [`RawBody`] from a stored body row (or an empty captured/uncaptured
-/// body when there is no row).
 fn load_body(
     conn: &Connection,
     sha: Option<&str>,

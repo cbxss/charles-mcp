@@ -1,15 +1,3 @@
-//! Replay a captured request against its origin server, with bounded mutation.
-//!
-//! Safety is the priority here (an agent reading an attacker-controlled response
-//! could be steered into crafting a replay):
-//!   * the target **host is fixed to the captured entry** — there is no host
-//!     override, so a replay can't be redirected to an arbitrary address (SSRF);
-//!   * mutating methods are gated by the caller (`allow_mutating`) on top of
-//!     `confirm` at the tool layer;
-//!   * the proxy is **off by default** (sent straight to the origin), and we
-//!     never trust `trust_env` proxy settings;
-//!   * hop-by-hop headers are stripped so the replay is well-formed.
-
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -20,8 +8,6 @@ use crate::config::Config;
 use crate::error::CharlesError;
 use crate::session::{Body, RawBody, Transaction, body, charset_from_content_type};
 
-/// Hop-by-hop / connection headers that must not be forwarded on a replay
-/// (reqwest sets host/content-length itself from the URL and body).
 const STRIP_HEADERS: &[&str] = &[
     "host",
     "content-length",
@@ -49,13 +35,10 @@ pub struct ReplayResult {
     pub body: Body,
     pub baseline_status: Option<u16>,
     pub elapsed_ms: u128,
-    /// True if the outgoing request carries an Authorization or Cookie header —
-    /// surfaced so the caller knows credentials were replayed.
     pub auth_present: bool,
     pub via_proxy: bool,
 }
 
-/// Replay `t` (with overrides) and return the decoded outcome.
 pub async fn replay(
     cfg: &Config,
     t: &Transaction,
@@ -66,7 +49,6 @@ pub async fn replay(
 
     let url = build_url(&t.url, &opts.query_overrides)?;
 
-    // Outgoing headers: original minus hop-by-hop, then caller overrides.
     let mut headers: Vec<(String, String)> = t
         .request
         .headers
@@ -94,8 +76,6 @@ pub async fn replay(
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("cookie"));
 
-    // Build a one-shot client. trust_env=false so ambient proxy/CA env can't
-    // silently redirect the request; proxy only when explicitly asked.
     let redirect = if opts.follow_redirects {
         Policy::limited(10)
     } else {
@@ -130,9 +110,6 @@ pub async fn replay(
         .collect();
     let resp_bytes = resp.bytes().await?.to_vec();
 
-    // Decode the response through our own decoder (handles protobuf/gRPC/charset;
-    // reqwest already inflated gzip/br, but we keep the encoding header in case it
-    // didn't, since decode() is a no-op on already-plaintext bodies).
     let raw = response_raw_body(&response_headers, resp_bytes);
     let decoded = body::decode(&raw, opts.max_body_bytes);
 
@@ -149,8 +126,6 @@ pub async fn replay(
     })
 }
 
-/// Apply query overrides to the captured URL. The scheme/host/port/path are
-/// taken verbatim from the capture — only query parameters can be changed.
 fn build_url(
     url: &str,
     overrides: &HashMap<String, Option<String>>,
@@ -178,20 +153,14 @@ fn build_url(
     Ok(u.to_string())
 }
 
-/// The outgoing body plus how it changes the content headers.
 struct BuiltBody {
     bytes: Option<Vec<u8>>,
-    /// A content-type to set (when an override re-encodes the body).
     content_type: Option<String>,
-    /// Drop the original content-encoding header (body is now plaintext).
     drop_encoding: bool,
 }
 
-/// Build the replay body from the original request plus any overrides.
 fn build_body(t: &Transaction, opts: &ReplayOptions) -> Result<BuiltBody, CharlesError> {
     if let Some(text) = &opts.body_text {
-        // Verbatim replacement — it's plaintext, so the original encoding header
-        // (gzip/br) no longer applies.
         return Ok(BuiltBody {
             bytes: Some(text.clone().into_bytes()),
             content_type: None,
@@ -237,8 +206,6 @@ fn build_body(t: &Transaction, opts: &ReplayOptions) -> Result<BuiltBody, Charle
         });
     }
 
-    // No body override: resend the original on-the-wire bytes (keeping the
-    // original content-encoding header so the origin interprets them correctly).
     if t.request.raw.captured && !t.request.raw.bytes.is_empty() {
         return Ok(BuiltBody {
             bytes: Some(t.request.raw.bytes.clone()),
@@ -253,7 +220,6 @@ fn build_body(t: &Transaction, opts: &ReplayOptions) -> Result<BuiltBody, Charle
     })
 }
 
-/// Decode the captured request body to text for JSON merging.
 fn decoded_request_text(t: &Transaction) -> Option<String> {
     match body::decode(&t.request.raw, 1 << 20) {
         Body::Text { text, .. } => Some(text),
@@ -297,9 +263,9 @@ mod tests {
     #[test]
     fn query_overrides_replace_and_remove() {
         let mut over = HashMap::new();
-        over.insert("a".to_string(), Some("2".to_string())); // replace
-        over.insert("b".to_string(), None); // remove
-        over.insert("c".to_string(), Some("9".to_string())); // add
+        over.insert("a".to_string(), Some("2".to_string()));
+        over.insert("b".to_string(), None);
+        over.insert("c".to_string(), Some("9".to_string()));
         let url = build_url("https://x.test/p?a=1&b=keepme&d=4", &over).unwrap();
         assert!(url.contains("a=2"), "{url}");
         assert!(!url.contains("b="), "b should be removed: {url}");
@@ -323,8 +289,8 @@ mod tests {
             ..Default::default()
         };
         let mut over_map = serde_json::Map::new();
-        over_map.insert("drop".into(), serde_json::Value::Null); // remove
-        over_map.insert("add".into(), serde_json::json!("x")); // add
+        over_map.insert("drop".into(), serde_json::Value::Null);
+        over_map.insert("add".into(), serde_json::json!("x"));
         let opts = ReplayOptions {
             query_overrides: HashMap::new(),
             header_overrides: HashMap::new(),

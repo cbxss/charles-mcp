@@ -1,22 +1,5 @@
-//! SQLite schema for the traffic store: connection pragmas, DDL, and versioned
-//! migrations (via `PRAGMA user_version`).
-//!
-//! Design notes (why this beats the reference's 6-table store and a naive draft):
-//!   * **Content-addressed `bodies`** — a body is stored once under its sha256, so
-//!     the repeated JS/JSON/images that dominate real sessions dedup, and multi-MB
-//!     blobs stay out of the hot `entries` row. `raw` is the on-the-wire payload;
-//!     decoding (gzip/brotli/protobuf/gRPC/WS) stays lazy, done on read.
-//!   * **FTS5** over url + headers + the *decoded* body preview gives instant,
-//!     ranked `search_traffic` — the reference has no full-text search at all. It
-//!     is a standalone (not external-content) table because `headers`/`body_text`
-//!     are derived at ingest, not columns on `entries`; its text copy is bounded
-//!     by the FTS cap and dropped with the capture.
-//!   * **Generated `is_error` + partial indexes** make error-hunting O(matches).
-//!   * **WS frames out-of-row** — a single connection can carry thousands.
-
 use rusqlite::Connection;
 
-/// Bumped whenever `SCHEMA_SQL` changes; an older DB is migrated by rebuild.
 pub const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA_SQL: &str = r#"
@@ -101,9 +84,6 @@ CREATE VIRTUAL TABLE entries_fts USING fts5(
 );
 "#;
 
-/// Open-time pragmas: WAL for reader/writer throughput, NORMAL sync (WAL-safe),
-/// foreign keys on (for ON DELETE CASCADE), a generous mmap, and incremental
-/// auto-vacuum so `reset`/eviction can reclaim space.
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -114,10 +94,6 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Initialize a freshly-opened connection: pragmas, then migrate to the current
-/// schema. On a version mismatch (older/empty DB) the data tables are dropped
-/// and recreated — the store is a cache, so rebuilding is cheaper than writing
-/// per-version migrations and always lands on the canonical DDL.
 pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
     apply_pragmas(conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -157,7 +133,6 @@ mod tests {
     fn schema_applies_and_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         initialize(&conn).unwrap();
-        // Re-initializing a current DB is a no-op (does not error or wipe).
         conn.execute(
             "INSERT INTO captures(capture_id, kind, created_at, last_used) \
              VALUES ('c1','live','t','t')",

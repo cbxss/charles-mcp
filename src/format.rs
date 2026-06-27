@@ -1,16 +1,12 @@
-//! Compact, context-frugal rendering of session summaries and details.
-
 use crate::replay::ReplayResult;
 use crate::session::{Body, Transaction, TxnSummary};
 use crate::store::EntryRow;
 use crate::tools::inspect::{SearchHit, Stats};
 
-/// Render a list of summaries as an aligned, compact table.
 pub fn summary_table(rows: &[TxnSummary]) -> String {
     if rows.is_empty() {
         return "requests: 0 total (no rows matched the filters)".to_string();
     }
-    // Column widths (path is truncated to keep rows scannable).
     const PATH_MAX: usize = 48;
     const HOST_MAX: usize = 28;
 
@@ -59,9 +55,6 @@ pub fn summary_table(rows: &[TxnSummary]) -> String {
     out
 }
 
-/// Render store entry rows as a table that also carries the resource-class tag
-/// (so API/JSON/error traffic is distinguishable from static-asset noise) — the
-/// rows arrive pre-sorted by priority.
 pub fn entry_table(rows: &[EntryRow]) -> String {
     if rows.is_empty() {
         return "requests: 0 total (no rows matched the filters)".to_string();
@@ -119,7 +112,6 @@ pub fn entry_table(rows: &[EntryRow]) -> String {
     out
 }
 
-/// Render the full detail of one transaction, including a decoded body.
 pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) -> String {
     let mut out = String::new();
     out.push_str(&format!("#{} {} {}\n", t.index, t.method, t.url));
@@ -198,7 +190,6 @@ fn render_headers(out: &mut String, headers: &[(String, String)]) {
     }
 }
 
-/// Render a single decoded body to a string (used by get_websocket_messages).
 pub fn render_body_str(body: &Body) -> String {
     let mut s = String::new();
     render_body(&mut s, body);
@@ -272,8 +263,6 @@ fn render_body(out: &mut String, body: &Body) {
     }
 }
 
-/// Render a replay outcome: a one-line preview (method, URL, whether creds were
-/// sent), the status vs. baseline, then response headers and the decoded body.
 pub fn replay_report(r: &ReplayResult) -> String {
     let mut out = String::new();
     let creds = if r.auth_present {
@@ -330,7 +319,6 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Render search hits compactly: one line per hit with index, field, snippet.
 pub fn search_results(hits: &[SearchHit]) -> String {
     if hits.is_empty() {
         return "0 hits (no rows matched the query)".to_string();
@@ -342,7 +330,6 @@ pub fn search_results(hits: &[SearchHit]) -> String {
     out
 }
 
-/// Render aggregate session statistics.
 pub fn stats_report(s: &Stats) -> String {
     let mut out = String::new();
     out.push_str(&format!(

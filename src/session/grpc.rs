@@ -1,34 +1,18 @@
-//! gRPC frame splitting + content-type classification.
-//!
-//! gRPC bodies are a sequence of length-prefixed frames; gRPC-Web additionally
-//! base64-wraps the whole stream ("grpc-web-text") and appends a trailers frame.
-
 use std::io::Read;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-/// Cap decompressed frame output to guard against decompression bombs.
 const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
-/// True for gRPC content-types (application/grpc, +proto, grpc-web, grpc-web-text).
-///
-/// `ct` is expected to already be lowercased.
 pub fn is_grpc_ct(ct: &str) -> bool {
     ct.starts_with("application/grpc")
 }
 
-/// True for the base64-wrapped gRPC-Web text transport.
-///
-/// `ct` is expected to already be lowercased.
 pub fn is_grpc_web_text_ct(ct: &str) -> bool {
     ct.starts_with("application/grpc-web-text")
 }
 
-/// True for a bare protobuf body (application/x-protobuf, `*+protobuf`, application/protobuf).
-///
-/// gRPC content-types also contain "protobuf"-adjacent tokens but are handled
-/// separately, so they are explicitly excluded here.
 pub fn is_protobuf_ct(ct: &str) -> bool {
     if is_grpc_ct(ct) {
         return false;
@@ -36,17 +20,11 @@ pub fn is_protobuf_ct(ct: &str) -> bool {
     ct == "application/x-protobuf" || ct == "application/protobuf" || ct.ends_with("+protobuf")
 }
 
-/// One gRPC length-prefixed frame: `[1B flags][4B BE len][len bytes]`.
-///
-/// `flags` bit0 (`0x01`) marks a compressed payload; bit7 (`0x80`) marks the
-/// gRPC-Web trailers frame, whose payload is trailer text rather than protobuf.
 pub struct Frame {
     pub flags: u8,
     pub data: Vec<u8>,
 }
 
-/// Split a (HTTP-decompressed) gRPC body into frames; `web_text` base64-decodes
-/// first. `None` if the stream doesn't tile cleanly into frames.
 pub fn split_frames(body: &[u8], web_text: bool) -> Option<Vec<Frame>> {
     let decoded;
     let bytes: &[u8] = if web_text {
@@ -59,7 +37,6 @@ pub fn split_frames(body: &[u8], web_text: bool) -> Option<Vec<Frame>> {
     let mut frames = Vec::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
-        // Need at least the 1-byte flags + 4-byte length header.
         if bytes.len() - pos < 5 {
             return None;
         }
@@ -85,9 +62,7 @@ pub fn split_frames(body: &[u8], web_text: bool) -> Option<Vec<Frame>> {
     Some(frames)
 }
 
-/// Decompress one frame's payload per `grpc-encoding` if its compressed bit is set.
 pub fn decompress_frame(frame: &Frame, grpc_encoding: Option<&str>) -> Option<Vec<u8>> {
-    // Compressed bit (0x01) clear => payload is already plain.
     if frame.flags & 0x01 == 0 {
         return Some(frame.data.clone());
     }
@@ -102,8 +77,6 @@ pub fn decompress_frame(frame: &Frame, grpc_encoding: Option<&str>) -> Option<Ve
             Some(out)
         }
         Some("deflate") => {
-            // gRPC "deflate" is zlib-wrapped per spec, but some implementations
-            // emit raw DEFLATE; try zlib first, then fall back to raw.
             let mut out = Vec::new();
             if flate2::read::ZlibDecoder::new(frame.data.as_slice())
                 .take(MAX_DECOMPRESSED)
@@ -119,9 +92,7 @@ pub fn decompress_frame(frame: &Frame, grpc_encoding: Option<&str>) -> Option<Ve
                 .ok()?;
             Some(out)
         }
-        // "identity" or unspecified: nothing to do (compressed bit notwithstanding).
         Some("identity") | None => Some(frame.data.clone()),
-        // Unknown encoding we can't handle.
         Some(_) => None,
     }
 }
@@ -156,7 +127,6 @@ mod tests {
         assert!(is_protobuf_ct("application/x-protobuf"));
         assert!(is_protobuf_ct("application/protobuf"));
         assert!(is_protobuf_ct("application/vnd.foo+protobuf"));
-        // gRPC types are handled separately, never reported as plain protobuf.
         assert!(!is_protobuf_ct("application/grpc+proto"));
         assert!(!is_protobuf_ct("application/grpc-web-text+proto"));
         assert!(!is_protobuf_ct("application/json"));
@@ -181,8 +151,7 @@ mod tests {
     #[test]
     fn splits_two_concatenated_frames() {
         let body = [
-            0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, // frame 1
-            0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, // frame 2
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF,
         ];
         let frames = split_frames(&body, false).expect("should tile");
         assert_eq!(frames.len(), 2);
@@ -192,7 +161,6 @@ mod tests {
 
     #[test]
     fn keeps_trailers_frame() {
-        // Trailers frame: flags 0x80, payload is ASCII trailer text.
         let body = [0x80, 0x00, 0x00, 0x00, 0x04, b'g', b'r', b'p', b'c'];
         let frames = split_frames(&body, false).expect("should tile");
         assert_eq!(frames.len(), 1);
@@ -202,18 +170,13 @@ mod tests {
 
     #[test]
     fn rejects_non_tiling_body() {
-        // Declares 9 bytes of payload but only 2 follow.
         let body = [0x00, 0x00, 0x00, 0x00, 0x09, 0x01, 0x02];
         assert!(split_frames(&body, false).is_none());
     }
 
     #[test]
     fn rejects_truncated_header() {
-        // Trailing leftover bytes shorter than a frame header.
-        let body = [
-            0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, // one complete frame
-            0x00, 0x00, // dangling partial header
-        ];
+        let body = [0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x00];
         assert!(split_frames(&body, false).is_none());
     }
 

@@ -89,7 +89,6 @@ fn http_status_503() {
 
 #[test]
 fn exception_state_is_treated_as_error() {
-    // The fixture's failed txn uses Charles's real "EXCEPTION" state.
     let txns = load();
     assert!(txns[3].error.is_some());
 }
@@ -108,7 +107,6 @@ fn https_tunnel_is_flagged_and_warned() {
     let detail = format::transaction_detail(t, &req, &resp);
     assert!(detail.contains("HTTPS tunnel"));
     assert!(detail.contains("SSL Proxying"));
-    // It must NOT render the ciphertext as if it were a real body.
     assert!(detail.contains("encrypted"));
 }
 

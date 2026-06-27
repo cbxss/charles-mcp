@@ -43,7 +43,6 @@ fn finds_quit() {
 #[test]
 fn export_is_not_confused_with_clear() {
     let d = discover();
-    // The clear form must not be selected as export.
     let export = d.export.unwrap();
     assert!(!export.path.contains("clear"));
 }

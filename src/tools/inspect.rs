@@ -1,6 +1,3 @@
-//! Pure inspection logic over a parsed [`Session`]: filtering, search, stats.
-//! Kept free of MCP/rmcp types so it can be unit-tested directly.
-
 use std::collections::HashMap;
 
 use regex::Regex;
@@ -9,7 +6,6 @@ use crate::error::CharlesError;
 use crate::session::{Body, HttpMessage, Session, Transaction, TxnSummary, body};
 use crate::tools::SearchField;
 
-/// Outcome of [`list`]: the (possibly truncated) rows plus the total match count.
 pub struct ListResult {
     pub rows: Vec<TxnSummary>,
     pub total: usize,
@@ -75,7 +71,6 @@ fn matches_filters(t: &Transaction, f: &ListFilters) -> bool {
     true
 }
 
-/// A search matcher: either a compiled regex or a case-insensitive substring.
 pub enum Matcher {
     Regex(Regex),
     Substr(String),
@@ -88,8 +83,6 @@ impl Matcher {
                 CharlesError::InvalidArg(format!("bad regex: {e}"))
             })?))
         } else {
-            // ASCII-fold so match offsets stay aligned with the original string
-            // (non-ASCII to_lowercase() can change byte length → wrong snippet).
             Ok(Matcher::Substr(query.to_ascii_lowercase()))
         }
     }
@@ -109,7 +102,6 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-/// Search url/headers/body of each transaction; at most one hit per transaction.
 pub fn search(
     session: &Session,
     matcher: &Matcher,
@@ -174,7 +166,6 @@ fn search_headers(
 }
 
 fn search_body(matcher: &Matcher, t: &Transaction) -> Option<String> {
-    // Decode with a generous cap so searches see real content.
     const SEARCH_CAP: usize = 1 << 20;
     let texts = [Some(&t.request), t.response.as_ref()];
     for msg in texts.into_iter().flatten() {
@@ -192,7 +183,6 @@ fn search_body(matcher: &Matcher, t: &Transaction) -> Option<String> {
     None
 }
 
-/// One-line context window around a match position.
 fn snippet(hay: &str, pos: usize) -> String {
     const CTX: usize = 40;
     let start = pos.saturating_sub(CTX);

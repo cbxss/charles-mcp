@@ -1,7 +1,3 @@
-//! Coarse resource classification + priority scoring for captured transactions,
-//! so list/browse can surface API/JSON/error traffic above static-asset noise.
-//! Ported from the heizaheiza/Charles-mcp `resource_classifier.py` heuristic.
-
 use super::Transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +14,6 @@ pub enum ResourceClass {
 }
 
 impl ResourceClass {
-    /// Stable lowercase tag stored in SQLite and shown to the agent.
     pub fn as_str(self) -> &'static str {
         match self {
             ResourceClass::Control => "control",
@@ -41,22 +36,16 @@ pub struct Classification {
     pub reasons: Vec<&'static str>,
 }
 
-/// Extensions that mark a static asset (images, styles, source maps).
 const STATIC_EXTS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".css", ".map",
 ];
-/// Web-font extensions.
 const FONT_EXTS: &[&str] = &[".woff", ".woff2", ".ttf", ".eot", ".otf"];
-/// Audio/video extensions.
 const MEDIA_EXTS: &[&str] = &[".mp3", ".mp4", ".wav", ".webm", ".mov", ".avi", ".m4a"];
-/// Script extensions.
 const SCRIPT_EXTS: &[&str] = &[".js", ".mjs"];
-/// Substrings in the path that hint at an API/auth surface.
 const API_HINTS: &[&str] = &[
     "/api/", "/graphql", "/rpc", "/auth", "/login", "/token", "/session",
 ];
 
-/// Classify one transaction (coarse class + priority + reasons).
 pub fn classify(t: &Transaction) -> Classification {
     let host = t.host.to_ascii_lowercase();
     let method = t.method.to_ascii_uppercase();
@@ -69,7 +58,6 @@ pub fn classify(t: &Transaction) -> Classification {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // Lowercased file extension (with leading dot) from the path, query stripped.
     let path_no_query = t.path.split('?').next().unwrap_or(&t.path);
     let ext = std::path::Path::new(path_no_query)
         .extension()
@@ -85,8 +73,6 @@ pub fn classify(t: &Transaction) -> Classification {
             reasons: Vec::new(),
         };
     }
-    // Our parser flags undecrypted HTTPS tunnels via the `tunnel` bool rather
-    // than always surfacing a CONNECT method, so treat both the same.
     if method == "CONNECT" || t.tunnel {
         return Classification {
             class: ResourceClass::ConnectTunnel,
@@ -136,7 +122,6 @@ pub fn classify(t: &Transaction) -> Classification {
         };
     }
 
-    // Scoring path: accumulate signals that this is API-shaped traffic.
     let mut reasons: Vec<&'static str> = Vec::new();
     let mut score: i64 = 20;
     let path_lower = t.path.to_ascii_lowercase();
@@ -178,7 +163,6 @@ mod tests {
     use super::*;
     use crate::session::{HttpMessage, RawBody};
 
-    /// A transaction with a JSON request Content-Type set.
     fn json_request() -> HttpMessage {
         HttpMessage {
             raw: RawBody {
@@ -251,7 +235,6 @@ mod tests {
             host: "example.com".into(),
             method: "GET".into(),
             path: "/static/app.js".into(),
-            // No response mime; classified purely by extension.
             ..Default::default()
         };
         let c = classify(&t);
@@ -272,7 +255,6 @@ mod tests {
         };
         let c = classify(&t);
         assert_eq!(c.class, ResourceClass::ApiCandidate);
-        // 20 base + 40 json + 25 api_path_hint + 15 mutating_method + 20 error_status = 120.
         assert_eq!(c.priority, 120);
         assert_eq!(
             c.reasons,

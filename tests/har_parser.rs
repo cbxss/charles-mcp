@@ -75,7 +75,6 @@ fn base64_binary_body_detected() {
 
 #[test]
 fn missing_response_is_none() {
-    // status 0 with no captured body → no response object (matches chlsj).
     let txns = load();
     let t = &txns[3];
     assert_eq!(t.status, None);

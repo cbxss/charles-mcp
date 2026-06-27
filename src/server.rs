@@ -1,5 +1,3 @@
-//! The MCP server: rmcp tool wiring over the Charles Web Interface client.
-
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,13 +22,8 @@ use crate::tools::{
 };
 use crate::web::WebClient;
 
-/// The live session's capture id in the store (a single rolling snapshot).
 const LIVE_CAPTURE: &str = "live";
 
-/// Validate a caller-supplied session path: it must be absolute (kills `-`
-/// argv-injection and relative surprises) and end in one of `allowed_exts`
-/// (so an agent can't be steered into reading/overwriting `~/.zshrc`, a plist,
-/// `authorized_keys`, etc.).
 fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, CharlesError> {
     let p = Path::new(path);
     if !p.is_absolute() {
@@ -54,12 +47,8 @@ fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, C
 #[derive(Clone)]
 pub struct CharlesServer {
     web: Arc<WebClient>,
-    /// The SQLite traffic store: ingest a session once, query it many times.
     store: Arc<TrafficStore>,
-    /// The current live capture and when it was ingested, so a burst of inspect
-    /// calls reuses one snapshot (and request indices stay stable) within the TTL.
     live: Arc<Mutex<Option<(Instant, CaptureRef)>>>,
-    /// Loaded `.proto` descriptors (from --proto-dir) for named decoding.
     #[cfg(feature = "proto")]
     proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
 }
@@ -91,7 +80,6 @@ impl CharlesServer {
         })
     }
 
-    /// Run a blocking store operation off the async runtime.
     async fn blocking<T, F>(&self, f: F) -> Result<T, CharlesError>
     where
         T: Send + 'static,
@@ -118,10 +106,6 @@ impl CharlesServer {
         CallToolResult::success(vec![Content::text(msg.into())])
     }
 
-    /// Ensure the requested session (live, or a file) is ingested into the store,
-    /// returning its capture id for the query tools. Live snapshots are reused
-    /// within the cache TTL (indices stay stable in that window); file captures
-    /// are ingested once per (path, mtime, size) and LRU-capped.
     async fn ensure_capture(&self, file_path: Option<&str>) -> Result<String, CharlesError> {
         match file_path {
             None => self.ensure_live_capture().await,
@@ -131,8 +115,6 @@ impl CharlesServer {
 
     async fn ensure_live_capture(&self) -> Result<String, CharlesError> {
         let ttl = self.web.config().cache_ttl();
-        // Compute freshness in a scope that drops the `live` guard before the
-        // await below (don't hold a lock across an await).
         let fresh = !ttl.is_zero()
             && self
                 .live
@@ -189,8 +171,6 @@ impl CharlesServer {
     }
 }
 
-/// Build a file capture's identity key (`path:mtime:size`) so an unchanged file
-/// is ingested only once.
 async fn file_source_key(path: &Path) -> Option<String> {
     let meta = tokio::fs::metadata(path).await.ok()?;
     let mtime = meta
@@ -202,9 +182,6 @@ async fn file_source_key(path: &Path) -> Option<String> {
     Some(format!("{}:{}:{}", path.display(), mtime, meta.len()))
 }
 
-/// Wrap a user query as an FTS5 phrase so punctuation / JSON-ish text is matched
-/// literally rather than being parsed as FTS query syntax (which would error on a
-/// stray quote or operator).
 fn fts_query(q: &str) -> String {
     format!("\"{}\"", q.replace('"', "\"\""))
 }
@@ -403,8 +380,6 @@ impl CharlesServer {
         let Some(t) = txn else {
             let cid = capture.clone();
             let count = self.blocking(move |s| s.entry_count(&cid)).await?;
-            // Return as a visible tool error (not a protocol error) so the agent
-            // sees the valid range and can recover.
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "request index {} is out of range; this session has {count} request(s) \
                  (valid indices 0..{}). Call list_requests first.",
@@ -479,8 +454,6 @@ impl CharlesServer {
             shown += 1;
             let arrow = if dir == "sent" { "→" } else { "←" };
             out.push_str(&format!("[{i}] {arrow} {:?}\n", m.opcode));
-            // Binary WS frames are often protobuf (MQTT/Tesla signaling, etc.) —
-            // try a schemaless decode before falling back to text/hex.
             if matches!(m.opcode, WsOpcode::Binary)
                 && let Some((tree, _)) =
                     crate::session::protobuf::try_decode(&m.payload.bytes, &opts)
@@ -511,8 +484,6 @@ impl CharlesServer {
         let capture = self.ensure_capture(req.file_path.as_deref()).await?;
         let limit = req.limit.unwrap_or(50);
         let hits = if req.regex {
-            // Regex needs to scan decoded bodies: reconstruct the capture and
-            // reuse the in-memory matcher (the FTS index can't do regex).
             let matcher = Matcher::build(&req.query, true)?;
             let fields = req.fields.clone().unwrap_or_default();
             let cid = capture.clone();
@@ -523,12 +494,8 @@ impl CharlesServer {
             };
             inspect::search(&session, &matcher, &fields, limit)
         } else if !req.query.chars().any(|c| c.is_alphanumeric()) {
-            // Empty or punctuation-only: FTS would tokenize to an empty phrase
-            // (a syntax error on some SQLite builds) — return no hits cleanly.
             Vec::new()
         } else {
-            // Default: FTS5 full-text (fast, ranked) over url + headers + the
-            // decoded body (including protobuf field trees).
             let q = fts_query(&req.query);
             let cid = capture.clone();
             let raw = self
@@ -657,8 +624,6 @@ impl CharlesServer {
             );
         }
         self.web.clear_session().await?;
-        // Drop the cached live snapshot so the next inspect call re-ingests the
-        // now-empty session instead of serving stale rows.
         *self.live.lock().await = None;
         Ok(Self::ok("Session cleared."))
     }
@@ -698,7 +663,6 @@ impl CharlesServer {
 #[tool_handler]
 impl ServerHandler for CharlesServer {
     fn get_info(&self) -> ServerInfo {
-        // ServerInfo/Implementation are #[non_exhaustive]; build from Default.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new("charles-mcp", env!("CARGO_PKG_VERSION"));
@@ -717,12 +681,9 @@ mod tests {
 
     #[test]
     fn path_must_be_absolute_with_allowed_ext() {
-        // relative path → rejected (also blocks leading-dash argv injection)
         assert!(validate_session_path("relative.har", &["har"]).is_err());
         assert!(validate_session_path("-rf.har", &["har"]).is_err());
-        // absolute but disallowed extension → rejected (no overwriting ~/.zshrc)
         assert!(validate_session_path("/home/u/.zshrc", &["har", "chlsj"]).is_err());
-        // absolute with an allowed extension → ok
         assert!(validate_session_path("/tmp/s.har", &["har", "chlsj", "chls"]).is_ok());
         assert!(validate_session_path("/tmp/s.chlsj", &["chlsj"]).is_ok());
     }

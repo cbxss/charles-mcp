@@ -1,13 +1,6 @@
-//! Integration tests for the SQLite traffic store: ingest a parsed `Session`
-//! once, then exercise the public query surface (list/get/search/stats) plus the
-//! content-addressed body dedup that keeps repeated payloads stored once.
-
 use charles_mcp::session::{HttpMessage, RawBody, Session, SessionSource, Transaction};
 use charles_mcp::store::{StoreFilters, TrafficStore};
 
-/// Build a minimal but realistic transaction. The request body is left
-/// uncaptured (only a Content-Type), so only the captured response body is
-/// content-addressed into the `bodies` table.
 fn txn(
     seq: usize,
     method: &str,
@@ -47,15 +40,10 @@ fn txn(
     }
 }
 
-/// Four transactions spanning the classifier's range: a static PNG, an HTML
-/// document, a JSON login POST (priority 100), and a JSON 500 error (priority
-/// 105). Their natural `seq` order is the reverse of their priority order, so
-/// `list` ordering is exercised meaningfully.
 fn sample_session() -> Session {
     Session {
         source: SessionSource::Live,
         transactions: vec![
-            // seq 0 — static_asset (priority 5)
             txn(
                 0,
                 "GET",
@@ -65,7 +53,6 @@ fn sample_session() -> Session {
                 "image/png",
                 b"\x89PNG\r\n\x1a\nlogo-bytes",
             ),
-            // seq 1 — document (priority 40)
             txn(
                 1,
                 "GET",
@@ -75,7 +62,6 @@ fn sample_session() -> Session {
                 "text/html",
                 b"<html><body>home</body></html>",
             ),
-            // seq 2 — api_candidate POST (20 + 40 json + 25 api hint + 15 mutating = 100)
             txn(
                 2,
                 "POST",
@@ -85,7 +71,6 @@ fn sample_session() -> Session {
                 "application/json",
                 br#"{"token":"abc","user":"sam"}"#,
             ),
-            // seq 3 — api_candidate GET 500 (20 + 40 json + 25 api hint + 20 error = 105)
             txn(
                 3,
                 "GET",
@@ -120,20 +105,17 @@ fn round_trip_list_get() {
     assert_eq!(total, 4);
     assert_eq!(rows.len(), 4);
 
-    // Ordered by priority DESC: each row's priority is >= the next's.
     for w in rows.windows(2) {
         assert!(
             w[0].priority >= w[1].priority,
             "rows not ordered by priority DESC"
         );
     }
-    // The api_candidate POST (seq 2) must sort before the static_asset PNG (seq 0).
     let pos = |seq: usize| rows.iter().position(|r| r.seq == seq).unwrap();
     assert!(pos(2) < pos(0), "api POST should outrank the static asset");
     assert_eq!(rows[pos(2)].resource_class, "api_candidate");
     assert_eq!(rows[pos(0)].resource_class, "static_asset");
 
-    // Reconstruct the POST and confirm the body + headers round-tripped.
     let got = store.get("live", 2).unwrap().expect("seq 2 exists");
     assert_eq!(got.method, "POST");
     let resp = got.response.expect("response present");
@@ -149,7 +131,6 @@ fn fts_finds_decoded_body() {
         .ingest("live", "live", None, None, &session, 65536)
         .unwrap();
 
-    // "token" appears only in the login response body (indexed decoded).
     let hits = store.search_fts("live", "token", 10).unwrap();
     assert!(
         !hits.is_empty(),
@@ -163,12 +144,9 @@ fn fts_finds_decoded_body() {
 
 #[test]
 fn content_addressed_dedup() {
-    // Persist to a real file so a second rusqlite connection can count body rows.
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("store.db");
 
-    // Two transactions share an identical response body; a third differs. So two
-    // distinct body contents are ingested across three entries.
     let shared = br#"{"payload":"identical bytes"}"#;
     let distinct = br#"{"payload":"different bytes"}"#;
     let session = Session {
@@ -212,8 +190,6 @@ fn content_addressed_dedup() {
         assert_eq!(cap.entry_count, 3);
     }
 
-    // Independent connection to the same DB: the bodies table holds one row per
-    // distinct content (2), not one per entry (3) — request bodies are uncaptured.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let body_count: i64 = conn
         .query_row("SELECT count(*) FROM bodies", [], |r| r.get(0))
@@ -232,7 +208,6 @@ fn filters_and_stats() {
         .ingest("live", "live", None, None, &session, 65536)
         .unwrap();
 
-    // resource_class filter returns only the two api_candidate entries.
     let (rows, total) = store
         .list(
             "live",
@@ -252,8 +227,6 @@ fn filters_and_stats() {
     assert_eq!(stats.errors, 1, "only the 500 response is an error");
 }
 
-/// Two byte-identical bodies with DIFFERENT content-types must not collide on
-/// one row (else the second reconstructs with the first's metadata).
 #[test]
 fn identical_bytes_different_content_type_do_not_collide() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -279,7 +252,6 @@ fn identical_bytes_different_content_type_do_not_collide() {
         store
             .ingest("live", "live", None, None, &session, 65536)
             .unwrap();
-        // Each entry reconstructs with its OWN content-type.
         let a = store.get("live", 0).unwrap().unwrap();
         let b = store.get("live", 1).unwrap().unwrap();
         assert_eq!(
@@ -291,7 +263,6 @@ fn identical_bytes_different_content_type_do_not_collide() {
             Some("text/plain")
         );
     }
-    // Same bytes but distinct metadata → two rows (not one).
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM bodies", [], |r| r.get(0))
@@ -299,8 +270,6 @@ fn identical_bytes_different_content_type_do_not_collide() {
     assert_eq!(n, 2, "different content-types must not share one body row");
 }
 
-/// Eviction must never drop the capture just ingested (regression for
-/// `--store-max-captures 0` self-eviction).
 #[test]
 fn evict_retains_at_least_the_newest() {
     let store = TrafficStore::open(None).unwrap();
@@ -315,7 +284,6 @@ fn evict_retains_at_least_the_newest() {
             65536,
         )
         .unwrap();
-    // keep=0 would naively evict everything; it must floor to 1.
     store.evict_file_captures(0).unwrap();
     assert_eq!(
         store.entry_count("file:one").unwrap(),

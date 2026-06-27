@@ -68,7 +68,6 @@ fn decodes_brotli() {
 
 #[test]
 fn already_decoded_guard_skips_decompress() {
-    // Encoding claims gzip but bytes are plain text (Charles pre-decoded it).
     let r = raw(
         b"plain not gzipped".to_vec(),
         Some("gzip"),

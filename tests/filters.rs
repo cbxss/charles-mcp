@@ -136,7 +136,7 @@ fn stats_aggregate() {
     let s = session();
     let st = inspect::stats(&s);
     assert_eq!(st.total, 5);
-    assert_eq!(st.errors, 1); // the 503
+    assert_eq!(st.errors, 1);
     assert_eq!(st.total_response_bytes, 36 + 39 + 20 + 11);
     assert_eq!(st.by_host[0], ("api.example.com".to_string(), 3));
 }

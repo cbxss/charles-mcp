@@ -18,8 +18,6 @@ protox = { version = "0.9.1", optional = true }
 regex = "1.12.4"
 reqwest = { version = "0.13.4", features = ["gzip", "deflate", "brotli", "json", "socks", "charset", "form"] }
 rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io"] }
-# Bundled SQLite (includes FTS5) for the traffic store. `bundled` builds SQLite
-# from source, so a C compiler is required at build time.
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 sha2 = "0.10.9"
 scraper = "0.27.0"
@@ -34,6 +32,4 @@ url = "2.5.8"
 
 [features]
 default = ["proto"]
-# Named protobuf/gRPC decoding via .proto files (pure-Rust; no protoc). The
-# schemaless decoder and gRPC framing work without this feature.
 proto = ["dep:protox", "dep:prost-reflect", "dep:prost"]

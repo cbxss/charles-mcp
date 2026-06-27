@@ -1,5 +1,3 @@
-//! charles-mcp — an MCP stdio server for Charles Proxy 5.
-
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -13,7 +11,6 @@ use charles_mcp::server::CharlesServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logs MUST go to stderr — stdout is the MCP stdio transport.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("CHARLES_LOG").unwrap_or_else(|_| EnvFilter::new("info")),

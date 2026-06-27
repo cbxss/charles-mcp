@@ -1,44 +1,13 @@
-//! RFC 6455 WebSocket frame parsing.
-//!
-//! Charles stores a `wss` connection's frames as a concatenated RFC 6455 stream
-//! in the request body (client→server, masked) and response body (server→client,
-//! unmasked). `parse_messages` turns one direction's already-base64-decoded byte
-//! stream into reassembled [`WsMessage`]s whose `payload` is later run through
-//! [`super::body::decode`].
-//!
-//! Wire format, per frame:
-//! ```text
-//!   byte0: FIN(1) | RSV(3) | opcode(4)
-//!   byte1: MASK(1) | len7(7)
-//!   len7 == 126 -> next 2 bytes big-endian = payload length
-//!   len7 == 127 -> next 8 bytes big-endian = payload length
-//!   MASK set    -> next 4 bytes = masking key; payload[i] ^= key[i % 4]
-//! ```
-//! Data frames (`Text`/`Binary`) with `FIN = 0` are followed by `Continuation`
-//! frames until one carries `FIN = 1`; those reassemble into a single message
-//! that keeps the original opcode. Control frames (`Close`/`Ping`/`Pong`) are
-//! standalone and never fragmented.
-
 use crate::session::{RawBody, WsDirection, WsMessage, WsOpcode};
 
-/// Continuation opcode: appends to the in-progress fragmented data message.
 const OPCODE_CONTINUATION: u8 = 0x0;
 
-/// Parse one direction's RFC 6455 frame stream into reassembled messages.
-///
-/// The actual per-frame `MASK` bit is honored regardless of `direction`
-/// (`Sent` frames are masked in practice, but we parse whatever is present).
-/// A truncated/partial trailing frame stops parsing; everything decoded so far
-/// is returned. Returns `[]` for an empty stream.
 pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
     let mut messages = Vec::new();
-    // In-progress fragmented data message: (opcode of its first frame, payload).
     let mut pending: Option<(WsOpcode, Vec<u8>)> = None;
     let mut pos = 0usize;
     let total = bytes.len();
 
-    // Each iteration consumes at least the 2-byte header, so `pos` strictly
-    // increases and the loop is bounded; any short read `break`s out.
     while pos + 2 <= total {
         let b0 = bytes[pos];
         let b1 = bytes[pos + 1];
@@ -47,7 +16,6 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
         let masked = b1 & 0x80 != 0;
         let len7 = b1 & 0x7F;
 
-        // Resolve the payload length and where the length field ends.
         let mut cursor = pos + 2;
         let payload_len: usize = match len7 {
             126 => {
@@ -70,7 +38,6 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
             n => n as usize,
         };
 
-        // Masking key (4 bytes) when the MASK bit is set.
         let mask_key = if masked {
             if cursor + 4 > total {
                 break;
@@ -87,8 +54,6 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
             None
         };
 
-        // Payload. A length that runs past the buffer is a truncated trailing
-        // frame: stop without allocating for the claimed (possibly huge) size.
         let data_end = match cursor.checked_add(payload_len) {
             Some(end) if end <= total => end,
             _ => break,
@@ -102,7 +67,6 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
         pos = data_end;
 
         if opcode & 0x08 != 0 {
-            // Control frame (Close/Ping/Pong/reserved): always standalone.
             messages.push(message(direction, map_opcode(opcode), payload));
         } else if opcode == OPCODE_CONTINUATION {
             match pending.as_mut() {
@@ -113,14 +77,10 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
                         messages.push(message(direction, op, buf));
                     }
                 }
-                // Stray continuation with nothing to continue (malformed): keep
-                // the bytes rather than drop them, as its own `Other(0)` message.
                 None if fin => messages.push(message(direction, WsOpcode::Other(0), payload)),
                 None => pending = Some((WsOpcode::Other(0), payload)),
             }
         } else {
-            // New data frame (Text/Binary/reserved). A dangling unfinished
-            // message here is a protocol violation; flush it so no bytes vanish.
             if let Some((op, buf)) = pending.take() {
                 messages.push(message(direction, op, buf));
             }
@@ -136,8 +96,6 @@ pub fn parse_messages(bytes: &[u8], direction: WsDirection) -> Vec<WsMessage> {
     messages
 }
 
-/// Map an RFC 6455 opcode nibble to [`WsOpcode`]. Continuation (`0x0`) is handled
-/// by the reassembler, so it only reaches here as a stray `Other(0)`.
 fn map_opcode(op: u8) -> WsOpcode {
     match op {
         0x1 => WsOpcode::Text,
@@ -149,7 +107,6 @@ fn map_opcode(op: u8) -> WsOpcode {
     }
 }
 
-/// Build a captured [`WsMessage`] from a reassembled payload.
 fn message(direction: WsDirection, opcode: WsOpcode, bytes: Vec<u8>) -> WsMessage {
     WsMessage {
         direction,
@@ -183,9 +140,6 @@ mod tests {
         assert!(text.contains("Unkown API Key"), "got: {text}");
     }
 
-    // Tesla masked/unmasked binary-frame tests use real captured fixtures and
-    // live in tests/real_capture.rs (gitignored) to keep real traffic out of git.
-
     #[test]
     fn synthetic_unmasked_text() {
         let frame = [0x81u8, 0x03, b'a', b'b', b'c'];
@@ -212,10 +166,7 @@ mod tests {
 
     #[test]
     fn synthetic_fragmented_text_reassembles() {
-        let frame = [
-            0x01u8, 0x02, b'a', b'b', // Text, FIN=0
-            0x80, 0x01, b'c', // Continuation, FIN=1
-        ];
+        let frame = [0x01u8, 0x02, b'a', b'b', 0x80, 0x01, b'c'];
         let msgs = parse_messages(&frame, WsDirection::Received);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].opcode, WsOpcode::Text);
@@ -224,7 +175,6 @@ mod tests {
 
     #[test]
     fn control_frame_emitted_standalone() {
-        // Empty Ping, then Text "hi".
         let frame = [0x89u8, 0x00, 0x81, 0x02, b'h', b'i'];
         let msgs = parse_messages(&frame, WsDirection::Received);
         assert_eq!(msgs.len(), 2);
@@ -241,8 +191,6 @@ mod tests {
 
     #[test]
     fn truncated_trailing_frame_is_dropped() {
-        // One complete Text "ab" frame, then a header claiming 5 payload bytes
-        // with only 2 present -> the partial frame is dropped.
         let frame = [0x81u8, 0x02, b'a', b'b', 0x81, 0x05, b'x', b'y'];
         let msgs = parse_messages(&frame, WsDirection::Received);
         assert_eq!(msgs.len(), 1);

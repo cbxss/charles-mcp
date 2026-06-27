@@ -1,10 +1,4 @@
-//! End-to-end: a chlsj `webSocket` transaction routes its bodies through the
-//! RFC 6455 parser into `Transaction.websocket`.
-
 use charles_mcp::session::{WsOpcode, chlsj};
-
-// The real Tesla protobuf-over-WS routing test lives in tests/real_capture.rs
-// (gitignored) to keep real traffic out of git.
 
 #[test]
 fn chlsj_text_websocket_frame() {

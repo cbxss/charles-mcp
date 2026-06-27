@@ -1,6 +1,3 @@
-//! Unified, normalized session model that both the HAR and `.chlsj` parsers
-//! target, plus the format sniffer, body decoder, and `charles convert` shim.
-
 pub mod body;
 pub mod chlsj;
 pub mod classify;
@@ -38,7 +35,6 @@ impl Session {
     }
 }
 
-/// One normalized request/response exchange.
 #[derive(Debug, Clone, Default)]
 pub struct Transaction {
     pub index: usize,
@@ -47,7 +43,6 @@ pub struct Transaction {
     pub scheme: String,
     pub host: String,
     pub method: String,
-    /// Path including the query string (e.g. `/api?x=1`).
     pub path: String,
     pub url: String,
     pub status: Option<u16>,
@@ -58,30 +53,19 @@ pub struct Transaction {
     pub client_addr: Option<String>,
     pub remote_addr: Option<String>,
     pub tls_version: Option<String>,
-    /// True for an HTTPS CONNECT tunnel Charles did NOT decrypt (SSL Proxying
-    /// not enabled for this host): any captured body is ciphertext, not real
-    /// content. Surfaced so the agent isn't misled into thinking the body was
-    /// simply "not captured".
     pub tunnel: bool,
-    /// Set when the transaction failed/was aborted (chlsj `errorMessage`/state).
     pub error: Option<String>,
     pub request: HttpMessage,
     pub response: Option<HttpMessage>,
-    /// WebSocket frames (when this transaction is a `wss`/`ws` connection).
-    /// `None` for ordinary HTTP transactions.
     pub websocket: Option<Vec<WsMessage>>,
 }
 
-/// Direction of a captured WebSocket message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsDirection {
-    /// client → server (these frames are masked on the wire).
     Sent,
-    /// server → client (unmasked).
     Received,
 }
 
-/// WebSocket frame opcode (RFC 6455).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsOpcode {
     Text,
@@ -89,16 +73,13 @@ pub enum WsOpcode {
     Ping,
     Pong,
     Close,
-    /// Any other/continuation opcode value.
     Other(u8),
 }
 
-/// One reassembled WebSocket message.
 #[derive(Debug, Clone)]
 pub struct WsMessage {
     pub direction: WsDirection,
     pub opcode: WsOpcode,
-    /// Decoded payload (text/binary/protobuf decided by [`body::decode`]).
     pub payload: RawBody,
 }
 
@@ -119,35 +100,27 @@ impl Transaction {
 
 #[derive(Debug, Clone, Default)]
 pub struct HttpMessage {
-    /// Ordered headers; duplicates preserved.
     pub headers: Vec<(String, String)>,
     pub raw: RawBody,
 }
 
 impl HttpMessage {
-    /// Case-insensitive header lookup (first match).
     pub fn header(&self, name: &str) -> Option<&str> {
         header_value(&self.headers, name)
     }
 }
 
-/// A body as captured, decoded lazily by [`body::decode`].
 #[derive(Debug, Clone, Default)]
 pub struct RawBody {
-    /// Bytes after any base64 unwrapping (still possibly compressed).
     pub bytes: Vec<u8>,
     pub content_encoding: Option<String>,
     pub content_type: Option<String>,
     pub declared_charset: Option<String>,
     pub was_base64_wrapped: bool,
-    /// False when Charles recorded that the body was not stored.
     pub captured: bool,
-    /// The `grpc-encoding` header (gzip/deflate/identity) for per-message gRPC
-    /// frame decompression — distinct from the HTTP `content_encoding`.
     pub grpc_encoding: Option<String>,
 }
 
-/// Presentation form of a body, produced on demand for `get_request`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Empty,
@@ -163,20 +136,15 @@ pub enum Body {
         sample_hex: String,
         truncated: bool,
     },
-    /// Decoded protobuf / gRPC body, rendered as an indented tree (schemaless)
-    /// or pretty JSON (named via a `.proto`).
     Protobuf {
         tree: String,
-        /// >1 for a gRPC stream; 1 for a bare protobuf body.
         message_count: usize,
-        /// True when decoded against a `.proto` type (named fields).
         named: bool,
         truncated: bool,
         original_len: u64,
     },
 }
 
-/// Compact, bodyless row used by list/search.
 #[derive(Debug, Clone)]
 pub struct TxnSummary {
     pub index: usize,
@@ -189,7 +157,6 @@ pub struct TxnSummary {
     pub duration_ms: Option<f64>,
 }
 
-/// Extract `charset` from a `Content-Type` value, if present (case-insensitive).
 pub fn charset_from_content_type(ct: Option<&str>) -> Option<String> {
     ct?.split(';').map(str::trim).find_map(|p| {
         p.get(..8)
@@ -198,7 +165,6 @@ pub fn charset_from_content_type(ct: Option<&str>) -> Option<String> {
     })
 }
 
-/// Case-insensitive header lookup over an ordered header list (first match).
 pub(crate) fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -206,10 +172,6 @@ pub(crate) fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> O
         .map(|(_, v)| v.as_str())
 }
 
-/// Heuristic guard against a silently-mismatched parse: if we got transactions
-/// but every one has an empty host AND method, the input schema almost
-/// certainly didn't match (serde filled all fields with defaults). Lets callers
-/// turn "parsed garbage, no error" into a clear failure.
 pub fn looks_like_schema_mismatch(txns: &[Transaction]) -> bool {
     !txns.is_empty()
         && txns
@@ -217,14 +179,12 @@ pub fn looks_like_schema_mismatch(txns: &[Transaction]) -> bool {
             .all(|t| t.host.is_empty() && t.method.is_empty())
 }
 
-/// Decode standard base64, yielding empty bytes on error (lenient by design).
 pub(crate) fn decode_base64(s: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .unwrap_or_default()
 }
 
-/// The essence (type/subtype) of a `Content-Type`, lower-cased, without params.
 pub fn mime_essence(ct: Option<&str>) -> Option<String> {
     ct.map(|c| c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())

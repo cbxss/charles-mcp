@@ -1,12 +1,3 @@
-//! The live read/control path: turn the running Charles session into bytes we
-//! can parse, and invoke the destructive session/quit actions.
-//!
-//! Layered and defensive, since the export/clear/quit endpoints are undocumented:
-//!   1. parse the control page (`discovery`) and use the discovered endpoint;
-//!   2. fall back to a small set of candidate paths;
-//!   3. for parsing, fall back to downloading the native `.chls` and running
-//!      `charles convert`.
-
 use reqwest::StatusCode;
 
 use super::WebClient;
@@ -17,7 +8,6 @@ use crate::session::{
 use crate::web::discovery::{self, DiscoveredEndpoints, EndpointSpec};
 
 impl WebClient {
-    /// Parse the control page once and cache the discovered endpoints.
     pub async fn discovered(&self) -> Result<DiscoveredEndpoints, CharlesError> {
         if let Some(d) = self.discovery.lock().await.clone() {
             return Ok(d);
@@ -28,13 +18,10 @@ impl WebClient {
         Ok(d)
     }
 
-    /// Drop the cached discovery (call after an endpoint unexpectedly 404s).
     pub async fn invalidate_discovery(&self) {
         *self.discovery.lock().await = None;
     }
 
-    /// Low-level control request returning (status, body) or `None` on a
-    /// transport error. Does not enforce success.
     async fn raw_request(
         &self,
         method: &str,
@@ -59,7 +46,6 @@ impl WebClient {
         Some((status, bytes))
     }
 
-    /// Fetch data: success status and a non-empty body.
     async fn fetch_data(
         &self,
         method: &str,
@@ -70,19 +56,13 @@ impl WebClient {
         (status.is_success() && !bytes.is_empty()).then_some(bytes)
     }
 
-    /// Invoke an action (clear/quit): only the status matters.
     async fn invoke(&self, spec: &EndpointSpec) -> bool {
         match self.raw_request(&spec.method, &spec.path, None).await {
             Some((status, _)) => status.is_success(),
-            // A quit that drops the connection looks like a transport error;
-            // callers treat the candidate fallbacks accordingly.
             None => false,
         }
     }
 
-    /// Fetch the live session and parse it, served from a short-lived cache so a
-    /// burst of inspect calls doesn't re-export Charles every time (this also
-    /// keeps request indices stable within the TTL window).
     pub async fn fetch_live_session(&self) -> Result<Session, CharlesError> {
         let ttl = self.config().cache_ttl();
         if !ttl.is_zero()
@@ -98,24 +78,14 @@ impl WebClient {
         Ok(session)
     }
 
-    /// Drop the cached live session (after a clear, or to force a refresh).
     pub async fn invalidate_live_cache(&self) {
         *self.live_cache.lock().await = None;
     }
 
-    /// Read the live session. Prefers the real `/session/export-json` endpoint
-    /// (our chlsj schema), then the discovery/candidate exports, then native
-    /// download + `charles convert`. Because export-json may omit WebSocket frames,
-    /// a session that contains an unframed WS upgrade is re-read via native convert.
     async fn fetch_live_session_uncached(&self) -> Result<Session, CharlesError> {
-        // Surface unreachable/auth problems with a clear message before probing.
         self.discovered().await?;
 
-        // 1. Real endpoint: GET /session/export-json (chlsj schema), long timeout.
         if let Some(transactions) = self.try_export_json().await {
-            // export-json has no WebSocket support upstream; if it dropped frames,
-            // re-read the whole session via native convert (which preserves them).
-            // If that re-read fails, fall through to returning what we have.
             if session_has_unframed_websocket(&transactions)
                 && let Ok(session) = self.fetch_via_native_convert().await
             {
@@ -127,7 +97,6 @@ impl WebClient {
             });
         }
 
-        // 2. Discovery/candidate exports (chlsj, then har).
         for fmt in ["chlsj", "har"] {
             if let Ok(bytes) = self.fetch_session_in_format(fmt).await
                 && let Ok(transactions) = sniff::parse_bytes(bytes)
@@ -140,13 +109,9 @@ impl WebClient {
             }
         }
 
-        // 3. Native download + convert.
         self.fetch_via_native_convert().await
     }
 
-    /// GET `/session/export-json` with the long export timeout. Returns parsed
-    /// transactions, or `None` if the endpoint is absent/empty/unparseable (so the
-    /// caller falls through to the legacy paths).
     async fn try_export_json(&self) -> Option<Vec<Transaction>> {
         let url = self.config().control_url("session/export-json");
         let mut req = self.http.get(&url).timeout(self.config().export_timeout());
@@ -168,9 +133,6 @@ impl WebClient {
         Some(transactions)
     }
 
-    /// Download the native session and `charles convert` it to chlsj — the only
-    /// path that preserves WebSocket frames and decrypted bodies the JSON export
-    /// may omit.
     async fn fetch_via_native_convert(&self) -> Result<Session, CharlesError> {
         let native = self.download_native().await?;
         let chlsj =
@@ -189,13 +151,11 @@ impl WebClient {
         })
     }
 
-    /// Fetch the current session as bytes in `format` (chlsj/har/xml/csv/chls).
     pub async fn fetch_session_in_format(&self, format: &str) -> Result<Vec<u8>, CharlesError> {
         if format.eq_ignore_ascii_case("chls") {
             return self.download_native().await;
         }
 
-        // 1. Discovered export endpoint (propagates unreachable/auth errors).
         let d = self.discovered().await?;
         if let Some(exp) = &d.export {
             let format_ok = exp.formats.is_empty()
@@ -208,16 +168,12 @@ impl WebClient {
             }
         }
 
-        // 2. Candidate export paths (idempotent GETs).
         for path in candidate_export_paths(format) {
             if let Some(bytes) = self.fetch_data("GET", &path, None).await {
                 return Ok(bytes);
             }
         }
 
-        // 3. Last resort: download the native session and convert it locally to
-        //    the requested format (needs the Charles binary). This is what makes
-        //    export to har/chlsj robust even if the web-export endpoint is absent.
         if let Ok(native) = self.download_native().await
             && let Ok(bytes) =
                 convert::convert_bytes(self.config(), &native, native_ext(&native), format).await
@@ -228,7 +184,6 @@ impl WebClient {
         Err(CharlesError::EndpointNotFound("session export"))
     }
 
-    /// Download the native `.chls` session bytes.
     pub async fn download_native(&self) -> Result<Vec<u8>, CharlesError> {
         let d = self.discovered().await?;
         if let Some(dl) = &d.download_chls {
@@ -250,7 +205,6 @@ impl WebClient {
         Err(CharlesError::EndpointNotFound("native session download"))
     }
 
-    /// Issue the discovered (or a candidate) export request for one format.
     async fn request_export(&self, exp: &EndpointSpec, format: &str) -> Option<Vec<u8>> {
         if exp.method.eq_ignore_ascii_case("POST") {
             let owned: Vec<(String, String)> = exp
@@ -269,8 +223,6 @@ impl WebClient {
         }
     }
 
-    /// Clear the current session (destructive). Invalidates the live cache so the
-    /// next inspect call reflects the now-empty session.
     pub async fn clear_session(&self) -> Result<(), CharlesError> {
         let d = self.discovered().await?;
         let cleared = match &d.clear {
@@ -301,13 +253,8 @@ impl WebClient {
         false
     }
 
-    /// Quit Charles (destructive).
     pub async fn quit_charles(&self) -> Result<(), CharlesError> {
         let d = self.discovered().await?;
-        // Fire the quit request best-effort. A *successful* quit tears down the
-        // proxy mid-request, so its return is unreliable — we verify by
-        // connectivity instead of trusting the response (the old bug reported a
-        // working quit as a failure and invited a retry).
         if let Some(ep) = &d.quit {
             let _ = self.raw_request(&ep.method, &ep.path, None).await;
         } else {
@@ -316,19 +263,16 @@ impl WebClient {
             }
         }
         match self.get_control_text("").await {
-            // Control host no longer reachable → Charles quit. Success.
             Err(CharlesError::Unreachable { .. }) => {
                 self.invalidate_live_cache().await;
                 self.invalidate_discovery().await;
                 Ok(())
             }
-            // Still reachable → the quit endpoint was wrong/unsupported.
             _ => Err(CharlesError::EndpointNotFound("quit")),
         }
     }
 }
 
-/// Append the export format as a query param to a discovered GET endpoint.
 fn export_get_path(exp: &EndpointSpec, format: &str) -> String {
     match &exp.format_field {
         Some(name) => {
@@ -345,16 +289,11 @@ fn export_get_path(exp: &EndpointSpec, format: &str) -> String {
     }
 }
 
-/// True if the session contains a WebSocket upgrade whose frames are missing —
-/// the signal that the JSON export dropped WS data and we must re-read natively.
 fn session_has_unframed_websocket(txns: &[Transaction]) -> bool {
     txns.iter()
         .any(|t| is_websocket_upgrade(t) && t.websocket.as_ref().is_none_or(|f| f.is_empty()))
 }
 
-/// Recognize a WebSocket upgrade from the HTTP signal alone (status 101 or an
-/// `Upgrade: websocket` header on either side), independent of whether frames
-/// were captured.
 fn is_websocket_upgrade(t: &Transaction) -> bool {
     if t.status == Some(101) {
         return true;
@@ -366,9 +305,6 @@ fn is_websocket_upgrade(t: &Transaction) -> bool {
     upgrades(&t.request) || t.response.as_ref().is_some_and(upgrades)
 }
 
-/// The native session download is the modern compressed `.chlz` (a zip) on Charles
-/// 5; older/uncompressed saves are raw `.chls`. `charles convert` keys off the
-/// suffix, so pick the right one from the magic bytes.
 fn native_ext(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"PK\x03\x04") {
         "chlz"
@@ -377,7 +313,6 @@ fn native_ext(bytes: &[u8]) -> &'static str {
     }
 }
 
-/// Best-effort candidate export paths derived from Charles's naming convention.
 fn candidate_export_paths(format: &str) -> Vec<String> {
     vec![
         format!("session/export-session?format={format}"),

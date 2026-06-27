@@ -1,7 +1,3 @@
-//! Exercises `charles convert` for real (skipped when Charles isn't installed).
-//! Catches plumbing bugs the synthetic tests can't — e.g. the output temp file
-//! must NOT pre-exist, since `charles convert` refuses to overwrite it.
-
 use std::path::Path;
 
 use charles_mcp::config::Config;
@@ -35,8 +31,6 @@ async fn convert_har_to_chlsj() {
 
 #[tokio::test]
 async fn read_session_file_converts_har() {
-    // read_session_file on a .har takes the direct path (no convert), but this
-    // confirms the end-to-end Session shape via the public API.
     let cfg = cfg();
     let session = convert::read_session_file(&cfg, Path::new("tests/fixtures/sample.har"))
         .await
