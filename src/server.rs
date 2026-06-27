@@ -219,7 +219,7 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_session_path(&req.path, &["chls", "har", "chlsj"])?;
+        let path = validate_session_path(&req.path, &["chls", "chlz", "har", "chlsj"])?;
         let session = convert::read_session_file(self.web.config(), &path).await?;
         let summaries = session.summaries();
         let table = format::summary_table(&summaries);

@@ -118,8 +118,9 @@ impl WebClient {
             }
         }
         // Native download + convert (requires the Charles binary).
-        let chls = self.download_native().await?;
-        let chlsj = convert::convert_bytes(self.config(), &chls, "chls", "chlsj").await?;
+        let native = self.download_native().await?;
+        let chlsj =
+            convert::convert_bytes(self.config(), &native, native_ext(&native), "chlsj").await?;
         let transactions = sniff::parse_bytes(chlsj)?;
         if looks_like_schema_mismatch(&transactions) {
             return Err(CharlesError::Parse(
@@ -160,11 +161,12 @@ impl WebClient {
             }
         }
 
-        // 3. Last resort: download the native .chls and convert it locally to the
-        //    requested format (needs the Charles binary). This is what makes
+        // 3. Last resort: download the native session and convert it locally to
+        //    the requested format (needs the Charles binary). This is what makes
         //    export to har/chlsj robust even if the web-export endpoint is absent.
-        if let Ok(chls) = self.download_native().await
-            && let Ok(bytes) = convert::convert_bytes(self.config(), &chls, "chls", format).await
+        if let Ok(native) = self.download_native().await
+            && let Ok(bytes) =
+                convert::convert_bytes(self.config(), &native, native_ext(&native), format).await
         {
             return Ok(bytes);
         }
@@ -286,6 +288,17 @@ fn export_get_path(exp: &EndpointSpec, format: &str) -> String {
             }
         }
         None => exp.path.clone(),
+    }
+}
+
+/// The native session download is the modern compressed `.chlz` (a zip) on Charles
+/// 5; older/uncompressed saves are raw `.chls`. `charles convert` keys off the
+/// suffix, so pick the right one from the magic bytes.
+fn native_ext(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"PK\x03\x04") {
+        "chlz"
+    } else {
+        "chls"
     }
 }
 

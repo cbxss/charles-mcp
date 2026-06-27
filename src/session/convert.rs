@@ -16,7 +16,8 @@ pub async fn read_session_file(cfg: &Config, path: &Path) -> Result<Session, Cha
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let bytes = if ext == "chls" {
+    let bytes = if ext == "chls" || ext == "chlz" {
+        // Native Charles formats (.chls / compressed .chlz) → convert to chlsj.
         convert_file(cfg, path, "chlsj").await?
     } else {
         tokio::fs::read(path).await?
