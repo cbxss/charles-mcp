@@ -61,6 +61,9 @@ pub struct Config {
 
     #[arg(long, env = "CHARLES_FTS_BODY_MAX_BYTES", default_value_t = 65_536)]
     pub fts_body_max_bytes: usize,
+
+    #[arg(long, env = "CHARLES_INCLUDE_CONTROL_TRAFFIC", default_value_t = false)]
+    pub include_control_traffic: bool,
 }
 
 impl Config {

@@ -59,7 +59,7 @@ is blocked on ground truth from a real instance.
 - [ ] **Auth realm / anonymous.** Verify basic-auth realm and that anonymous-allowed vs authenticated is reported correctly by `charles_status`.
   - Files: `WebClient::status`, `raw_request`/`send_control` in `src/web/{mod,live}.rs`.
 
-- [ ] **Performance on a real (hundreds-of-MB) session.** Partly addressed: the SQLite store ingests once and queries from SQL/FTS (no re-parse per call), and `--export-timeout-ms` separates the whole-session read from per-request timeouts. Still to do live: measure export+convert cost, tune `--cache-ttl-ms`, check for a delta/`since` export param, and consider a streaming parse instead of whole-session-in-RAM.
+- [ ] **Performance on a real (hundreds-of-MB) session.** Partly addressed: the SQLite store ingests once and queries from SQL/FTS (no re-parse per call), `--export-timeout-ms` separates the whole-session read from per-request timeouts, and the server's own `control.charles` reads are dropped from the session by default (`--include-control-traffic` to keep them) — confirmed live that repeated `/session/export-json` reads otherwise nest and the session balloons exponentially (66 KB → 80 MB over a few reads). Still to do live: measure export+convert cost, tune `--cache-ttl-ms`, check for a delta/`since` export param, consider a streaming parse instead of whole-session-in-RAM, and document the Charles-side recording filter that excludes `control.charles` at the source.
   - Files: `fetch_live_session` in `src/web/live.rs`, `resolve_session` in `src/server.rs`.
 
 ## P2 — capabilities a Charles power user expects (feature work, not bugs)

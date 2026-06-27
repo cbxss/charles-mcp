@@ -71,7 +71,10 @@ impl WebClient {
         {
             return Ok(sess.clone());
         }
-        let session = self.fetch_live_session_uncached().await?;
+        let mut session = self.fetch_live_session_uncached().await?;
+        if !self.config().include_control_traffic {
+            strip_control_traffic(&mut session, &self.config().control_host);
+        }
         if !ttl.is_zero() {
             *self.live_cache.lock().await = Some((std::time::Instant::now(), session.clone()));
         }
@@ -305,6 +308,15 @@ fn is_websocket_upgrade(t: &Transaction) -> bool {
     upgrades(&t.request) || t.response.as_ref().is_some_and(upgrades)
 }
 
+fn strip_control_traffic(session: &mut Session, control_host: &str) {
+    session
+        .transactions
+        .retain(|t| !t.host.eq_ignore_ascii_case(control_host));
+    for (i, t) in session.transactions.iter_mut().enumerate() {
+        t.index = i;
+    }
+}
+
 fn native_ext(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"PK\x03\x04") {
         "chlz"
@@ -320,4 +332,35 @@ fn candidate_export_paths(format: &str) -> Vec<String> {
         format!("session/export-session.{format}"),
         format!("session.{format}"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Transaction;
+
+    fn txn(host: &str) -> Transaction {
+        Transaction {
+            host: host.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strips_control_traffic_and_reindexes() {
+        let mut s = Session {
+            source: SessionSource::Live,
+            transactions: vec![
+                txn("control.charles"),
+                txn("api.example.com"),
+                txn("CONTROL.CHARLES"),
+                txn("cdn.example.com"),
+            ],
+        };
+        strip_control_traffic(&mut s, "control.charles");
+        let hosts: Vec<&str> = s.transactions.iter().map(|t| t.host.as_str()).collect();
+        assert_eq!(hosts, ["api.example.com", "cdn.example.com"]);
+        assert_eq!(s.transactions[0].index, 0);
+        assert_eq!(s.transactions[1].index, 1);
+    }
 }

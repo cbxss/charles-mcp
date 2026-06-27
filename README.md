@@ -62,6 +62,7 @@ Optional. Every flag has an env-var fallback; precedence is **CLI flag > env var
 | `--db-path` / `CHARLES_DB_PATH` | _(none)_ | Persist the SQLite store here; default is ephemeral (in-memory) |
 | `--store-max-captures` / `CHARLES_STORE_MAX_CAPTURES` | `10` | Max stored *file* captures kept (LRU-evicted; live is always retained) |
 | `--fts-body-max-bytes` / `CHARLES_FTS_BODY_MAX_BYTES` | `65536` | Cap on decoded body text indexed per message for full-text search |
+| `--include-control-traffic` / `CHARLES_INCLUDE_CONTROL_TRAFFIC` | `false` | Keep the server's own `control.charles` requests in the live session (off by default — they're noise and bloat the session) |
 
 Set `CHARLES_LOG=debug` for verbose logs (written to stderr, never the stdio transport).
 
@@ -77,7 +78,7 @@ charles-mcp ──HTTP──▶ Charles proxy (127.0.0.1:8888) ──internal─
 
 - **HTTPS needs SSL Proxying.** Charles only decrypts a host's HTTPS if you've enabled **Proxy → SSL Proxying** for it. Undecrypted requests are CONNECT tunnels; the server flags them (`⚠ HTTPS tunnel — not decrypted`) rather than pretending the body is missing.
 - **`set_tool` toggles master switches only.** `map-*`, `rewrite`, `*-list`, and `dns-spoofing` do nothing without **rules** (GUI-only; not managed here). **`breakpoints` pauses/hangs matching traffic** waiting for manual action in Charles, which this server can't supply. Both cases are called out in the tool output.
-- **Live inspection reads the session once and ingests it,** refreshed every `--cache-ttl-ms` (also keeps indices stable in a burst). The read uses Charles's `/session/export-json`; a session with WebSocket frames falls back to a native download + `charles convert`, since the JSON export omits WS frames. Bounded by `--export-timeout-ms`.
+- **Live inspection reads the session once and ingests it,** refreshed every `--cache-ttl-ms` (also keeps indices stable in a burst). The read uses Charles's `/session/export-json`; a session with WebSocket frames falls back to a native download + `charles convert`, since the JSON export omits WS frames. Bounded by `--export-timeout-ms`. The server's own `control.charles` requests are dropped from the session by default (`--include-control-traffic` to keep them) — Charles records them, and each export-json read otherwise nests the previous one, so the session balloons. To stop Charles recording them at the source, add a recording filter excluding `control.charles`.
 - **`charles convert`** runs the Charles binary and can collide with a running instance. Bounded by `--convert-timeout-ms`.
 - **The SQLite store is ephemeral by default** (in-memory; gone on exit). Set `--db-path` to persist captures; `reset_store` (with `confirm: true`) drops everything.
 
