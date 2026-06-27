@@ -44,12 +44,17 @@ fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, C
     Ok(p.to_path_buf())
 }
 
+#[derive(Default)]
+struct LiveState {
+    snapshot: Option<(Instant, CaptureRef)>,
+    watermark: usize,
+}
+
 #[derive(Clone)]
 pub struct CharlesServer {
     web: Arc<WebClient>,
     store: Arc<TrafficStore>,
-    live: Arc<Mutex<Option<(Instant, CaptureRef)>>>,
-    live_watermark: Arc<Mutex<usize>>,
+    live: Arc<Mutex<LiveState>>,
     #[cfg(feature = "proto")]
     proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
 }
@@ -75,8 +80,7 @@ impl CharlesServer {
         Ok(Self {
             web,
             store,
-            live: Arc::new(Mutex::new(None)),
-            live_watermark: Arc::new(Mutex::new(0)),
+            live: Arc::new(Mutex::new(LiveState::default())),
             #[cfg(feature = "proto")]
             proto,
         })
@@ -91,15 +95,6 @@ impl CharlesServer {
         tokio::task::spawn_blocking(move || f(&store))
             .await
             .map_err(|e| CharlesError::Parse(format!("store task failed: {e}")))?
-    }
-
-    async fn live_count(&self) -> usize {
-        self.live
-            .lock()
-            .await
-            .as_ref()
-            .map(|(_, c)| c.entry_count)
-            .unwrap_or(0)
     }
 
     fn decode_opts<'a>(
@@ -131,6 +126,7 @@ impl CharlesServer {
                 .live
                 .lock()
                 .await
+                .snapshot
                 .as_ref()
                 .is_some_and(|(at, _)| at.elapsed() < ttl);
         if fresh {
@@ -144,7 +140,7 @@ impl CharlesServer {
                 s.ingest(LIVE_CAPTURE, "live", Some("live"), None, &session, fts_cap)
             })
             .await?;
-        *self.live.lock().await = Some((Instant::now(), cref));
+        self.live.lock().await.snapshot = Some((Instant::now(), cref));
         Ok(LIVE_CAPTURE.to_string())
     }
 
@@ -381,10 +377,16 @@ impl CharlesServer {
             ),
             None => None,
         };
-        let live_count = if is_live { self.live_count().await } else { 0 };
-        let min_seq = if is_live && req.only_new {
-            let watermark = (*self.live_watermark.lock().await).min(live_count);
-            Some(watermark as i64)
+        let min_seq = if is_live {
+            let mut live = self.live.lock().await;
+            let count = live
+                .snapshot
+                .as_ref()
+                .map(|(_, c)| c.entry_count)
+                .unwrap_or(0);
+            let since = req.only_new.then(|| live.watermark.min(count) as i64);
+            live.watermark = count;
+            since
         } else {
             None
         };
@@ -401,9 +403,6 @@ impl CharlesServer {
         };
         let cid = capture.clone();
         let (rows, total) = self.blocking(move |s| s.list(&cid, &filters)).await?;
-        if is_live {
-            *self.live_watermark.lock().await = live_count;
-        }
         let truncated = total > rows.len();
         let header = format!(
             "requests: {} total, {} shown{} (sorted by priority). Pass a row's # to get_request.\n",
@@ -678,8 +677,7 @@ impl CharlesServer {
             );
         }
         self.web.clear_session().await?;
-        *self.live.lock().await = None;
-        *self.live_watermark.lock().await = 0;
+        *self.live.lock().await = LiveState::default();
         Ok(Self::ok("Session cleared."))
     }
 
@@ -698,8 +696,7 @@ impl CharlesServer {
             );
         }
         self.blocking(|s| s.reset()).await?;
-        *self.live.lock().await = None;
-        *self.live_watermark.lock().await = 0;
+        *self.live.lock().await = LiveState::default();
         Ok(Self::ok("Traffic store reset."))
     }
 

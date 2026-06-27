@@ -98,14 +98,9 @@ impl WebClient {
         let html = self
             .get_control_text(&format!("tools/{}/", tool.segment()))
             .await?;
-        let low = html.to_lowercase();
-        let after = low
-            .split_once("status:")
-            .map(|(_, rest)| rest)
-            .ok_or_else(|| {
-                CharlesError::Parse("no 'Status:' marker found on the tool page".into())
-            })?;
-        let window: String = after.chars().take(40).collect();
+        let window = status_window(&html).ok_or_else(|| {
+            CharlesError::Parse("no 'Status:' marker found on the tool page".into())
+        })?;
         if window.contains("disabled") {
             Ok(false)
         } else if window.contains("enabled") {
@@ -118,15 +113,14 @@ impl WebClient {
     }
 }
 
-fn throttle_active(html: &str) -> bool {
+fn status_window(html: &str) -> Option<String> {
     let low = html.to_lowercase();
-    match low.split_once("status:") {
-        Some((_, rest)) => {
-            let window: String = rest.chars().take(40).collect();
-            !window.contains("stopped")
-        }
-        None => false,
-    }
+    low.split_once("status:")
+        .map(|(_, rest)| rest.chars().take(40).collect())
+}
+
+fn throttle_active(html: &str) -> bool {
+    status_window(html).is_some_and(|w| !w.contains("stopped"))
 }
 
 fn scrape_presets(html: &str) -> Vec<String> {
