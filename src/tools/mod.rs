@@ -2,6 +2,8 @@
 
 pub mod inspect;
 
+use std::collections::HashMap;
+
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 
@@ -182,6 +184,46 @@ pub struct SearchReq {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StatsReq {
     /// Inspect this session file instead of the live Charles session.
+    #[serde(default)]
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplayReq {
+    /// 0-based index of the captured request to replay (from list_requests).
+    pub index: usize,
+    /// Must be true to actually send the request — replay makes a REAL network
+    /// call to the origin server.
+    pub confirm: bool,
+    /// Must ALSO be true to replay a mutating method (POST/PUT/PATCH/DELETE),
+    /// which may change server state. GET/HEAD do not require this.
+    #[serde(default)]
+    pub allow_mutating: bool,
+    /// Override/add query parameters; a null value removes that parameter.
+    #[serde(default)]
+    pub query_overrides: Option<HashMap<String, Option<String>>>,
+    /// Override/add request headers; a null value removes that header. The target
+    /// host cannot be changed (it is fixed to the captured entry).
+    #[serde(default)]
+    pub header_overrides: Option<HashMap<String, Option<String>>>,
+    /// Merge these keys into a JSON request body (a null value removes the key).
+    /// Requires the original body to be JSON (or absent).
+    #[serde(default)]
+    pub json_overrides: Option<serde_json::Value>,
+    /// Replace the entire request body with this exact text.
+    #[serde(default)]
+    pub body_text: Option<String>,
+    /// Send the replay THROUGH the Charles proxy so it is re-captured in the live
+    /// session (default false → sent directly to the origin).
+    #[serde(default)]
+    pub use_proxy: bool,
+    /// Follow redirects (default false, so you see the raw 3xx).
+    #[serde(default)]
+    pub follow_redirects: bool,
+    /// Cap on decoded response body bytes shown.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+    /// Replay from this session file instead of the live Charles session.
     #[serde(default)]
     pub file_path: Option<String>,
 }

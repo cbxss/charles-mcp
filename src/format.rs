@@ -1,5 +1,6 @@
 //! Compact, context-frugal rendering of session summaries and details.
 
+use crate::replay::ReplayResult;
 use crate::session::{Body, Transaction, TxnSummary};
 use crate::store::EntryRow;
 use crate::tools::inspect::{SearchHit, Stats};
@@ -269,6 +270,40 @@ fn render_body(out: &mut String, body: &Body) {
             }
         }
     }
+}
+
+/// Render a replay outcome: a one-line preview (method, URL, whether creds were
+/// sent), the status vs. baseline, then response headers and the decoded body.
+pub fn replay_report(r: &ReplayResult) -> String {
+    let mut out = String::new();
+    let creds = if r.auth_present {
+        " (Authorization/Cookie sent)"
+    } else {
+        ""
+    };
+    let via = if r.via_proxy {
+        " via Charles proxy"
+    } else {
+        " direct to origin"
+    };
+    out.push_str(&format!("replayed {} {}{creds}{via}\n", r.method, r.url));
+    let baseline = r
+        .baseline_status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".into());
+    let changed = r.baseline_status.map(|b| b != r.status).unwrap_or(true);
+    out.push_str(&format!(
+        "status: {} (baseline {}){}  ·  {} ms\n",
+        r.status,
+        baseline,
+        if changed { " [changed]" } else { "" },
+        r.elapsed_ms,
+    ));
+    out.push_str("\n── response headers ──\n");
+    render_headers(&mut out, &r.response_headers);
+    out.push_str("\nbody:\n");
+    render_body(&mut out, &r.body);
+    out
 }
 
 pub fn human_size(bytes: u64) -> String {

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod format;
+pub mod replay;
 pub mod server;
 pub mod session;
 pub mod store;
