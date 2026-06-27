@@ -11,13 +11,10 @@ fn filters(limit: usize) -> StoreFilters {
     }
 }
 
-// ---- chlsj parser edge cases -------------------------------------------------
-
 #[test]
 fn empty_array_parses_to_nothing_and_is_not_a_mismatch() {
     let txns = chlsj::parse(b"[]").expect("empty array parses");
     assert!(txns.is_empty());
-    // An empty session must NOT be flagged as a schema mismatch.
     assert!(!looks_like_schema_mismatch(&txns));
 }
 
@@ -44,10 +41,8 @@ fn invalid_base64_body_is_lenient_not_fatal() {
     ]"#;
     let txns = chlsj::parse(json).expect("invalid base64 must not fail the parse");
     let resp = txns[0].response.as_ref().unwrap();
-    // Lenient decode yields empty bytes; the message is still marked captured.
     assert!(resp.raw.bytes.is_empty());
     assert!(resp.raw.captured);
-    // Decoding an empty captured body renders as Empty, not garbage.
     assert_eq!(
         body::decode(&resp.raw, 4096),
         charles_mcp::session::Body::Empty
@@ -89,12 +84,9 @@ fn duplicate_headers_are_preserved_in_order() {
 
 #[test]
 fn one_all_empty_entry_is_flagged_as_schema_mismatch() {
-    // A single object with no recognized fields → host+method empty → mismatch.
     let txns = chlsj::parse(br#"[{}]"#).unwrap();
     assert!(looks_like_schema_mismatch(&txns));
 }
-
-// ---- store edge cases --------------------------------------------------------
 
 fn txn(seq: usize, host: &str, status: Option<u16>, body: &[u8]) -> Transaction {
     Transaction {
@@ -155,7 +147,6 @@ fn reingest_replaces_wholesale_and_bumps_generation() {
     assert_eq!(c0.generation, 0);
     assert_eq!(c0.entry_count, 3);
 
-    // A smaller snapshot replaces the old one entirely (no merge).
     let second = live(vec![txn(0, "z.example.com", Some(204), b"")]);
     let c1 = store
         .ingest("live", "live", None, None, &second, 4096)
@@ -165,7 +156,6 @@ fn reingest_replaces_wholesale_and_bumps_generation() {
     let (rows, total) = store.list("live", &filters(50)).unwrap();
     assert_eq!(total, 1);
     assert_eq!(rows[0].host, "z.example.com");
-    // The old seq 2 is gone, not lingering from the larger first snapshot.
     assert!(store.get("live", 2).unwrap().is_none());
 }
 
@@ -183,7 +173,6 @@ fn get_out_of_range_seq_is_none_not_an_error() {
         )
         .unwrap();
     assert!(store.get("live", 99).unwrap().is_none());
-    // An unknown capture id also yields nothing rather than erroring.
     assert!(store.get("does-not-exist", 0).unwrap().is_none());
     assert_eq!(store.entry_count("does-not-exist").unwrap(), 0);
 }
@@ -209,7 +198,7 @@ fn fts_with_no_match_returns_empty() {
 fn entry_with_no_response_round_trips_as_none() {
     let store = TrafficStore::open(None).unwrap();
     let mut t = txn(0, "h", None, b"");
-    t.response = None; // request issued, no response captured
+    t.response = None;
     store
         .ingest("live", "live", None, None, &live(vec![t]), 4096)
         .unwrap();
@@ -221,7 +210,6 @@ fn entry_with_no_response_round_trips_as_none() {
 #[test]
 fn empty_but_captured_body_reconstructs_without_a_body_row() {
     let store = TrafficStore::open(None).unwrap();
-    // captured=true with empty bytes → no body stored, but the flag round-trips.
     let mut t = txn(0, "h", Some(204), b"");
     t.response.as_mut().unwrap().raw.captured = true;
     store

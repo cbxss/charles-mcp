@@ -197,8 +197,8 @@ impl WebClient {
             self.invalidate_discovery().await;
         }
         for path in [
-            "session/download-session",
             "session/download",
+            "session/download-session",
             "session/export-session?format=chls",
         ] {
             if let Some(bytes) = self.fetch_data("GET", path, None).await {
@@ -244,7 +244,7 @@ impl WebClient {
     }
 
     async fn try_clear_candidates(&self) -> bool {
-        for path in ["session/clear-session", "session/clear"] {
+        for path in ["session/clear", "session/clear-session"] {
             for method in ["POST", "GET"] {
                 if let Some((status, _)) = self.raw_request(method, path, None).await
                     && status.is_success()
@@ -333,12 +333,25 @@ fn native_ext(bytes: &[u8]) -> &'static str {
 }
 
 fn candidate_export_paths(format: &str) -> Vec<String> {
-    vec![
-        format!("session/export-session?format={format}"),
-        format!("session/export?format={format}"),
-        format!("session/export-session.{format}"),
-        format!("session.{format}"),
-    ]
+    let mut paths = Vec::new();
+    if let Some(real) = real_export_path(format) {
+        paths.push(real.to_string());
+    }
+    paths.push(format!("session/export-session?format={format}"));
+    paths.push(format!("session/export?format={format}"));
+    paths.push(format!("session/export-session.{format}"));
+    paths.push(format!("session.{format}"));
+    paths
+}
+
+fn real_export_path(format: &str) -> Option<&'static str> {
+    match format {
+        "chlsj" => Some("session/export-json"),
+        "har" => Some("session/export-har"),
+        "xml" => Some("session/export-xml"),
+        "csv" => Some("session/export-csv"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -375,7 +388,6 @@ mod tests {
         ]);
         strip_control_traffic(&mut s, "control.charles");
         assert_eq!(hosts(&s), ["api.example.com", "cdn.example.com"]);
-        // Surviving entries are re-indexed 0..n with no gaps.
         let idx: Vec<usize> = s.transactions.iter().map(|t| t.index).collect();
         assert_eq!(idx, [0, 1]);
     }
@@ -404,8 +416,6 @@ mod tests {
     #[test]
     fn respects_a_custom_control_host() {
         let mut s = sess(&["my.control.host", "control.charles", "keep.example.com"]);
-        // A custom --control-host strips only that host; the default magic host
-        // is now just ordinary traffic and is kept.
         strip_control_traffic(&mut s, "my.control.host");
         assert_eq!(hosts(&s), ["control.charles", "keep.example.com"]);
     }
@@ -414,7 +424,19 @@ mod tests {
     fn does_not_strip_a_host_that_merely_contains_control_host() {
         let mut s = sess(&["notcontrol.charles.evil.com", "control.charles"]);
         strip_control_traffic(&mut s, "control.charles");
-        // Only the exact host (modulo port) is stripped, not a superstring.
-        assert_eq!(hosts(&s), ["notcontrol.charles.evil.com"]);
+        assert_eq!(
+            hosts(&s),
+            ["notcontrol.charles.evil.com"],
+            "only the exact host (modulo port) is stripped, not a superstring"
+        );
+    }
+
+    #[test]
+    fn export_candidates_lead_with_confirmed_real_endpoints() {
+        assert_eq!(candidate_export_paths("chlsj")[0], "session/export-json");
+        assert_eq!(candidate_export_paths("har")[0], "session/export-har");
+        assert_eq!(candidate_export_paths("xml")[0], "session/export-xml");
+        assert_eq!(candidate_export_paths("csv")[0], "session/export-csv");
+        assert_eq!(real_export_path("chls"), None);
     }
 }

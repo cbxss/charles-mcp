@@ -1,11 +1,11 @@
-# TODO — fixes that need a live Charles 5
+# TODO — remaining work (mostly verified live)
 
-These are the items from the adversarial power-user review that **cannot be
-verified or finished without a running Charles 5 install**. The no-live-Charles
-work is done: the schema/decoders grounded in real captures, the real
-`/session/export-json` read path, the SQLite traffic store (ingest-once +
-FTS5 + dedup), classification/priority, and `replay_request`. Everything below
-is blocked on ground truth from a real instance.
+Most of this list is now **confirmed against a real Charles 5**: the read path
+(`/session/export-json`), the real session endpoints (`session/export-{json,har,
+xml,csv}`, `session/download`, `session/clear`, `quit`), the control verbs
+(recording / throttling / tools + `get_tool_status`), `charles convert`,
+`replay_request`, anonymous-auth reporting, and the schema/decoders/store. What
+remains is a handful of edge conditions and feature work, marked below.
 
 ## How to unblock all of this (do once)
 
@@ -33,30 +33,27 @@ is blocked on ground truth from a real instance.
 
 ## P0 — endpoint discovery (live read/clear/quit ride guessed paths)
 
-- [ ] **Capture the real `control.charles` page and validate `discover_from_html`**.
-  - The provisional `tests/fixtures/control_page.html` is hand-authored. Replace with a real capture and confirm `discover_from_html` extracts export/download/clear/quit (method, path, format `<select>`).
-  - Files: `src/web/discovery.rs`, `tests/discovery.rs`, `tests/fixtures/control_page.html`.
+- [x] **Captured the real `control.charles` pages and validated `discover_from_html`.** The real root page is just nav links (`throttling/ recording/ tools/ session/ quit`) — the only endpoint it exposes is `quit`; the session ops live on the `session/` subpage as relative links. Both captured as `tests/fixtures/control_page.html` + `control_session_page.html`; `tests/discovery.rs` now asserts the real behavior (root → quit; subpage → clear/export/download with relative, prefix-less paths).
 
-- [ ] **Lock the real session endpoint paths** (replace the invented candidates).
-  - Only `session/download` (native `.chls`) is confirmed. `session/export-session?format=…`, `session/clear-session`, `quit`/`application/quit`/`shutdown` are guesses.
-  - Files: `candidate_export_paths`, `download_native`, `try_clear_candidates`, `quit_charles` in `src/web/live.rs`.
-  - Done when: `export_session` (chlsj+har), `clear_session`, `quit_charles` work against a real install via discovery (not the convert fallback).
+- [x] **Locked the real session endpoint paths** (confirmed live + wired as primary candidates).
+  - Confirmed `200` against real Charles 5: `session/export-json` (= our chlsj), `session/export-har`, `session/export-xml`, `session/export-csv`, `session/download` (native), `session/clear`, `quit`. The older `session/export-session?format=…` guesses all `404`. `candidate_export_paths` now maps each format to its real `session/export-*` path first; `download_native` leads with `session/download`; `try_clear_candidates` leads with `session/clear`.
+  - Files: `candidate_export_paths`, `real_export_path`, `download_native`, `try_clear_candidates` in `src/web/live.rs`.
+  - Live-verified: `export_session` chlsj + har round-trip (export → read_session_file), `clear_session`. Not yet: `quit_charles` (would close Charles).
 
 ## P1 — robustness / behavior to verify live
 
-- [ ] **`charles convert` invocation.** Confirm whether `/Applications/Charles.app/Contents/MacOS/Charles convert in out` actually works, or whether the `charles` CLI wrapper (Help → Install Command Line Tools) is required. Check behavior while Charles is **already running** (single-instance collision) and on a trial/unregistered copy (license nag → relies on `--convert-timeout-ms`).
-  - Files: `src/session/convert.rs`, `charles_bin` default in `src/config.rs`. Consider defaulting `--charles-bin` to the `charles` CLI if that's the supported path.
+- [x] **`charles convert` invocation — works** with the default `/Applications/Charles.app/Contents/MacOS/Charles convert in out`, **including while Charles is already running** (no single-instance collision); the gated `convert_real.rs` tests pass against the live install. Not exercised: a trial/unregistered copy's license nag (still relies on `--convert-timeout-ms`).
 
-- [ ] **Control verbs end-to-end.** Recording start/stop, throttling activate/deactivate, every `tools/<seg>/enable|disable` — confirm each actually takes effect (they match the reference but were never executed live).
+- [x] **Control verbs end-to-end — confirmed live.** `start_recording`/`stop_recording`, `set_throttling` activate/deactivate, and `set_tool` toggle all return success against real Charles 5.
   - Files: `src/web/control.rs`.
 
-- [ ] **`get_tool_status` parsing** against the real tool page. Confirm the `Status: Enabled/Disabled` marker text and that the 40-char window heuristic holds.
+- [x] **`get_tool_status` parsing — confirmed live.** Round-tripped `block-cookies` disabled → enabled → disabled and read the `Status:` marker back correctly each time (proves `set_tool` takes effect *and* the parse heuristic holds).
   - Files: `get_tool_status` in `src/web/control.rs`.
 
-- [ ] **Throttling presets.** Confirm the activate response; consider reading back the active preset / enumerating configured presets so `set_throttling` can validate the name instead of silently succeeding.
+- [ ] **Throttling presets.** `set_throttling` on/off confirmed live; still: confirm a named preset takes effect, and consider reading back / enumerating configured presets so `set_throttling` can validate the name instead of silently succeeding.
   - Files: `set_throttling` in `src/web/control.rs`, description in `src/server.rs`.
 
-- [ ] **Auth realm / anonymous.** Verify basic-auth realm and that anonymous-allowed vs authenticated is reported correctly by `charles_status`.
+- [ ] **Auth realm / anonymous.** Anonymous-access reporting confirmed live (`charles_status` → "anonymous access"). Still: verify the basic-auth realm and the authenticated path with credentials set.
   - Files: `WebClient::status`, `raw_request`/`send_control` in `src/web/{mod,live}.rs`.
 
 - [ ] **Performance on a real (hundreds-of-MB) session.** Partly addressed: the SQLite store ingests once and queries from SQL/FTS (no re-parse per call), `--export-timeout-ms` separates the whole-session read from per-request timeouts, and the server's own `control.charles` reads are dropped from the session by default (`--include-control-traffic` to keep them) — confirmed live that repeated `/session/export-json` reads otherwise nest and the session balloons exponentially (66 KB → 80 MB over a few reads). Still to do live: measure export+convert cost, tune `--cache-ttl-ms`, check for a delta/`since` export param, consider a streaming parse instead of whole-session-in-RAM, and document the Charles-side recording filter that excludes `control.charles` at the source.
@@ -65,7 +62,7 @@ is blocked on ground truth from a real instance.
 ## P2 — capabilities a Charles power user expects (feature work, not bugs)
 
 - [ ] Respond to **breakpoints** (intercept → edit → Execute/Abort). Today enabling breakpoints can hang traffic with no way to release it. The Web Interface exposes no breakpoint-response endpoint, so this likely needs a different integration path.
-- [x] **Compose / Repeat / Repeat Advanced** — delivered by `replay_request` (re-issue a captured request with query/header/json/body overrides, mutating-gated). Pending live validation against a real origin. (Still open: "get request as curl/raw".)
+- [x] **Compose / Repeat / Repeat Advanced** — delivered by `replay_request` (re-issue a captured request with query/header/json/body overrides, mutating-gated) and **live-validated** (replayed a real GET → 200 with baseline diff). (Still open: "get request as curl/raw".)
 - [ ] **Rule management** for Map Local / Map Remote / Rewrite / Breakpoints (the master-switch toggles are no-ops without rules).
 - [ ] **Live tail / Focus / per-host watch** without re-exporting the whole session.
 

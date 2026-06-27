@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn json_overrides_with_no_original_body_start_from_empty_object() {
-        let t = Transaction::default(); // no request body
+        let t = Transaction::default();
         let mut over = serde_json::Map::new();
         over.insert("a".into(), serde_json::json!(1));
         let built =
@@ -336,7 +336,7 @@ mod tests {
     fn json_overrides_on_a_non_object_body_is_a_clear_error() {
         let mut t = Transaction::default();
         t.request.raw = RawBody {
-            bytes: b"[1,2,3]".to_vec(), // a JSON array, not an object
+            bytes: b"[1,2,3]".to_vec(),
             content_type: Some("application/json".into()),
             captured: true,
             ..Default::default()
