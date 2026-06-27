@@ -311,10 +311,17 @@ fn is_websocket_upgrade(t: &Transaction) -> bool {
 fn strip_control_traffic(session: &mut Session, control_host: &str) {
     session
         .transactions
-        .retain(|t| !t.host.eq_ignore_ascii_case(control_host));
+        .retain(|t| !host_is_control(&t.host, control_host));
     for (i, t) in session.transactions.iter_mut().enumerate() {
         t.index = i;
     }
+}
+
+fn host_is_control(host: &str, control_host: &str) -> bool {
+    fn bare(h: &str) -> &str {
+        h.split(':').next().unwrap_or(h)
+    }
+    bare(host).eq_ignore_ascii_case(bare(control_host))
 }
 
 fn native_ext(bytes: &[u8]) -> &'static str {
@@ -339,28 +346,75 @@ mod tests {
     use super::*;
     use crate::session::Transaction;
 
-    fn txn(host: &str) -> Transaction {
-        Transaction {
-            host: host.to_string(),
-            ..Default::default()
+    fn sess(hosts: &[&str]) -> Session {
+        Session {
+            source: SessionSource::Live,
+            transactions: hosts
+                .iter()
+                .enumerate()
+                .map(|(i, h)| Transaction {
+                    index: i,
+                    host: (*h).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
         }
     }
 
+    fn hosts(s: &Session) -> Vec<&str> {
+        s.transactions.iter().map(|t| t.host.as_str()).collect()
+    }
+
     #[test]
-    fn strips_control_traffic_and_reindexes() {
-        let mut s = Session {
-            source: SessionSource::Live,
-            transactions: vec![
-                txn("control.charles"),
-                txn("api.example.com"),
-                txn("CONTROL.CHARLES"),
-                txn("cdn.example.com"),
-            ],
-        };
+    fn strips_control_and_reindexes_contiguously() {
+        let mut s = sess(&[
+            "control.charles",
+            "api.example.com",
+            "CONTROL.CHARLES",
+            "cdn.example.com",
+        ]);
         strip_control_traffic(&mut s, "control.charles");
-        let hosts: Vec<&str> = s.transactions.iter().map(|t| t.host.as_str()).collect();
-        assert_eq!(hosts, ["api.example.com", "cdn.example.com"]);
-        assert_eq!(s.transactions[0].index, 0);
-        assert_eq!(s.transactions[1].index, 1);
+        assert_eq!(hosts(&s), ["api.example.com", "cdn.example.com"]);
+        // Surviving entries are re-indexed 0..n with no gaps.
+        let idx: Vec<usize> = s.transactions.iter().map(|t| t.index).collect();
+        assert_eq!(idx, [0, 1]);
+    }
+
+    #[test]
+    fn strips_port_suffixed_control_host() {
+        let mut s = sess(&["control.charles:80", "real.example.com"]);
+        strip_control_traffic(&mut s, "control.charles");
+        assert_eq!(hosts(&s), ["real.example.com"]);
+    }
+
+    #[test]
+    fn all_control_becomes_empty() {
+        let mut s = sess(&["control.charles", "control.charles"]);
+        strip_control_traffic(&mut s, "control.charles");
+        assert!(s.transactions.is_empty());
+    }
+
+    #[test]
+    fn no_control_is_a_noop() {
+        let mut s = sess(&["a.example.com", "b.example.com"]);
+        strip_control_traffic(&mut s, "control.charles");
+        assert_eq!(hosts(&s), ["a.example.com", "b.example.com"]);
+    }
+
+    #[test]
+    fn respects_a_custom_control_host() {
+        let mut s = sess(&["my.control.host", "control.charles", "keep.example.com"]);
+        // A custom --control-host strips only that host; the default magic host
+        // is now just ordinary traffic and is kept.
+        strip_control_traffic(&mut s, "my.control.host");
+        assert_eq!(hosts(&s), ["control.charles", "keep.example.com"]);
+    }
+
+    #[test]
+    fn does_not_strip_a_host_that_merely_contains_control_host() {
+        let mut s = sess(&["notcontrol.charles.evil.com", "control.charles"]);
+        strip_control_traffic(&mut s, "control.charles");
+        // Only the exact host (modulo port) is stripped, not a superstring.
+        assert_eq!(hosts(&s), ["notcontrol.charles.evil.com"]);
     }
 }

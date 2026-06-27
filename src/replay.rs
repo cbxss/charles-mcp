@@ -308,4 +308,75 @@ mod tests {
         assert_eq!(v["add"], "x");
         assert!(v.get("drop").is_none(), "drop should be removed");
     }
+
+    fn opts_with(json: Option<serde_json::Value>, body_text: Option<String>) -> ReplayOptions {
+        ReplayOptions {
+            query_overrides: HashMap::new(),
+            header_overrides: HashMap::new(),
+            json_overrides: json,
+            body_text,
+            use_proxy: false,
+            follow_redirects: false,
+            max_body_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn json_overrides_with_no_original_body_start_from_empty_object() {
+        let t = Transaction::default(); // no request body
+        let mut over = serde_json::Map::new();
+        over.insert("a".into(), serde_json::json!(1));
+        let built =
+            build_body(&t, &opts_with(Some(serde_json::Value::Object(over)), None)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&built.bytes.unwrap()).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn json_overrides_on_a_non_object_body_is_a_clear_error() {
+        let mut t = Transaction::default();
+        t.request.raw = RawBody {
+            bytes: b"[1,2,3]".to_vec(), // a JSON array, not an object
+            content_type: Some("application/json".into()),
+            captured: true,
+            ..Default::default()
+        };
+        let mut over = serde_json::Map::new();
+        over.insert("a".into(), serde_json::json!(1));
+        let err = build_body(&t, &opts_with(Some(serde_json::Value::Object(over)), None));
+        assert!(err.is_err(), "merging into a non-object body must error");
+    }
+
+    #[test]
+    fn body_text_override_replaces_verbatim_and_drops_encoding() {
+        let mut t = Transaction::default();
+        t.request.raw = RawBody {
+            bytes: b"original".to_vec(),
+            content_encoding: Some("gzip".into()),
+            captured: true,
+            ..Default::default()
+        };
+        let built = build_body(&t, &opts_with(None, Some("brand new".into()))).unwrap();
+        assert_eq!(built.bytes.as_deref(), Some(b"brand new".as_slice()));
+        assert!(
+            built.drop_encoding,
+            "plaintext replacement drops content-encoding"
+        );
+    }
+
+    #[test]
+    fn query_override_adds_to_a_url_that_had_no_query() {
+        let mut over = HashMap::new();
+        over.insert("k".to_string(), Some("v".to_string()));
+        let url = build_url("https://x.test/path", &over).unwrap();
+        assert_eq!(url, "https://x.test/path?k=v");
+    }
+
+    #[test]
+    fn removing_the_only_query_param_clears_the_query_string() {
+        let mut over = HashMap::new();
+        over.insert("only".to_string(), None);
+        let url = build_url("https://x.test/p?only=1", &over).unwrap();
+        assert_eq!(url, "https://x.test/p");
+    }
 }
