@@ -34,3 +34,4 @@ jobs:
         with:
           files: charles-mcp-${{ matrix.target }}.tar.gz
           generate_release_notes: true
+          make_latest: true
