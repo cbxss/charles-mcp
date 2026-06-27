@@ -82,8 +82,6 @@ charles-mcp ──HTTP──▶ Charles proxy (127.0.0.1:8888) ──internal─
 - **`charles convert`** runs the Charles binary and can collide with a running instance. Bounded by `--convert-timeout-ms`.
 - **The SQLite store is ephemeral by default** (in-memory; gone on exit). Set `--db-path` to persist captures; `reset_store` (with `confirm: true`) drops everything.
 
-## Validation & credit
+## Validation
 
 The `.chlsj` schema, the decoders (protobuf/gRPC/WebSocket), and the live `/session/export-json` path are grounded in **real Charles 5 captures** (a schema mismatch fails loudly rather than returning blank rows). The control verbs (recording/throttling/tools), basic auth, and proxy routing follow the Charles docs; the `.har` 1.2 path is standard.
-
-The SQLite store, the resource classifier, and replay were informed by the prior-art Python implementation [**heizaheiza/Charles-mcp**](https://github.com/heizaheiza/Charles-mcp) — with an improved schema (FTS5 full-text search + content-addressed body dedup, neither of which it has) and a decoder it lacks (protobuf/gRPC/WebSocket/brotli).
