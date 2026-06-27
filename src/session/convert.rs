@@ -65,10 +65,11 @@ pub async fn convert_file(
     if !cfg.charles_bin.exists() {
         return Err(CharlesError::CharlesBinMissing(cfg.charles_bin.clone()));
     }
-    let out = tempfile::Builder::new()
-        .suffix(&format!(".{out_ext}"))
-        .tempfile()?;
-    let out_path = out.path().to_path_buf();
+    // `charles convert` refuses to overwrite an existing output file, so the
+    // output path must NOT exist yet — use a temp dir + a fresh name inside it
+    // (not `tempfile()`, which creates the file).
+    let dir = tempfile::tempdir()?;
+    let out_path = dir.path().join(format!("session.{out_ext}"));
 
     let run = Command::new(&cfg.charles_bin)
         .arg("convert")

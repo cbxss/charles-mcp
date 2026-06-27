@@ -17,6 +17,18 @@ use super::{
 };
 use crate::error::CharlesError;
 
+/// Charles writes `-1` as a "not set" sentinel for many numeric fields. Map any
+/// negative value (or null) to `None` instead of failing the strict unsigned
+/// parse (`invalid value: integer -1, expected u32`).
+fn lenient_unsigned<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<i64>,
+{
+    let v = Option::<i64>::deserialize(de)?;
+    Ok(v.and_then(|n| T::try_from(n).ok()))
+}
+
 pub fn parse(bytes: &[u8]) -> Result<Vec<Transaction>, CharlesError> {
     let txns: Vec<ChlsTxn> =
         serde_json::from_slice(bytes).map_err(|e| CharlesError::Parse(format!("chlsj: {e}")))?;
@@ -33,9 +45,9 @@ struct ChlsTxn {
     host: Option<String>,
     #[serde(default)]
     scheme: Option<String>,
-    #[serde(default, rename = "actualPort")]
+    #[serde(default, rename = "actualPort", deserialize_with = "lenient_unsigned")]
     actual_port: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_unsigned")]
     port: Option<u32>,
     #[serde(default)]
     path: Option<String>,
@@ -85,7 +97,7 @@ struct ChlsSsl {
 #[derive(Deserialize, Default)]
 struct ChlsMessage {
     /// HTTP status code (present on the response side).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_unsigned")]
     status: Option<u16>,
     #[serde(default)]
     header: Option<ChlsHeader>,
@@ -126,13 +138,13 @@ struct ChlsBody {
     charset: Option<String>,
     #[serde(default, rename = "mimeType")]
     mime_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_unsigned")]
     size: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
 struct ChlsSizes {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_unsigned")]
     body: Option<u64>,
 }
 
@@ -338,5 +350,52 @@ fn parse_time_start(times: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
             chrono::DateTime::from_timestamp_millis(millis)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tolerates_minus_one_sentinels() {
+        // Charles emits -1 for "not set" on actualPort/port/status/sizes.
+        let json = br#"[
+          {
+            "host": "example.com",
+            "scheme": "https",
+            "method": "GET",
+            "path": "/x",
+            "actualPort": -1,
+            "port": -1,
+            "request": { "header": { "headers": [] }, "sizes": { "body": -1 } },
+            "response": {
+              "status": -1,
+              "header": { "headers": [] },
+              "body": { "size": -1 },
+              "sizes": { "body": -1 }
+            }
+          }
+        ]"#;
+        let txns = parse(json).expect("must parse despite -1 sentinels");
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].host, "example.com");
+        // -1 status maps to None (no misleading status).
+        assert_eq!(txns[0].status, None);
+    }
+
+    #[test]
+    fn parses_real_port_and_status() {
+        let json = br#"[
+          {
+            "host": "api.example.com", "scheme": "https", "method": "POST", "path": "/v1",
+            "actualPort": 8443,
+            "response": { "status": 201, "header": { "headers": [] } }
+          }
+        ]"#;
+        let txns = parse(json).expect("parse");
+        assert_eq!(txns[0].status, Some(201));
+        // Non-default port appears in the URL.
+        assert!(txns[0].url.contains(":8443"), "url was {}", txns[0].url);
     }
 }

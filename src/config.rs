@@ -63,6 +63,13 @@ pub struct Config {
     #[arg(long, env = "CHARLES_CONVERT_TIMEOUT_MS", default_value_t = 60_000)]
     pub convert_timeout_ms: u64,
 
+    /// Timeout (ms) for fetching the *whole* live session (the export-json /
+    /// native-download read), separate from `--timeout-ms`: a real 50+ MB
+    /// capture takes far longer than a control call, and the per-request timeout
+    /// would abort it and mis-report it as "endpoint not found".
+    #[arg(long, env = "CHARLES_EXPORT_TIMEOUT_MS", default_value_t = 60_000)]
+    pub export_timeout_ms: u64,
+
     /// Preferred format when fetching/exporting the live session.
     #[arg(long, env = "CHARLES_EXPORT_FORMAT", default_value = "chlsj")]
     pub default_export_format: String,
@@ -103,6 +110,10 @@ impl Config {
 
     pub fn convert_timeout(&self) -> Duration {
         Duration::from_millis(self.convert_timeout_ms)
+    }
+
+    pub fn export_timeout(&self) -> Duration {
+        Duration::from_millis(self.export_timeout_ms)
     }
 }
 

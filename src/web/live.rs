@@ -11,7 +11,9 @@ use reqwest::StatusCode;
 
 use super::WebClient;
 use crate::error::CharlesError;
-use crate::session::{Session, SessionSource, convert, looks_like_schema_mismatch, sniff};
+use crate::session::{
+    Session, SessionSource, Transaction, convert, looks_like_schema_mismatch, sniff,
+};
 use crate::web::discovery::{self, DiscoveredEndpoints, EndpointSpec};
 
 impl WebClient {
@@ -101,11 +103,31 @@ impl WebClient {
         *self.live_cache.lock().await = None;
     }
 
-    /// Prefers chlsj, then har, then native `.chls` + `charles convert`.
+    /// Read the live session. Prefers the real `/session/export-json` endpoint
+    /// (our chlsj schema), then the discovery/candidate exports, then native
+    /// download + `charles convert`. Because export-json may omit WebSocket frames,
+    /// a session that contains an unframed WS upgrade is re-read via native convert.
     async fn fetch_live_session_uncached(&self) -> Result<Session, CharlesError> {
-        // Surface unreachable/auth problems with a clear message before we start
-        // probing export endpoints.
+        // Surface unreachable/auth problems with a clear message before probing.
         self.discovered().await?;
+
+        // 1. Real endpoint: GET /session/export-json (chlsj schema), long timeout.
+        if let Some(transactions) = self.try_export_json().await {
+            // export-json has no WebSocket support upstream; if it dropped frames,
+            // re-read the whole session via native convert (which preserves them).
+            // If that re-read fails, fall through to returning what we have.
+            if session_has_unframed_websocket(&transactions)
+                && let Ok(session) = self.fetch_via_native_convert().await
+            {
+                return Ok(session);
+            }
+            return Ok(Session {
+                source: SessionSource::Live,
+                transactions,
+            });
+        }
+
+        // 2. Discovery/candidate exports (chlsj, then har).
         for fmt in ["chlsj", "har"] {
             if let Ok(bytes) = self.fetch_session_in_format(fmt).await
                 && let Ok(transactions) = sniff::parse_bytes(bytes)
@@ -117,7 +139,39 @@ impl WebClient {
                 });
             }
         }
-        // Native download + convert (requires the Charles binary).
+
+        // 3. Native download + convert.
+        self.fetch_via_native_convert().await
+    }
+
+    /// GET `/session/export-json` with the long export timeout. Returns parsed
+    /// transactions, or `None` if the endpoint is absent/empty/unparseable (so the
+    /// caller falls through to the legacy paths).
+    async fn try_export_json(&self) -> Option<Vec<Transaction>> {
+        let url = self.config().control_url("session/export-json");
+        let mut req = self.http.get(&url).timeout(self.config().export_timeout());
+        if let Some(user) = &self.config().web_user {
+            req = req.basic_auth(user, self.config().web_pass.clone());
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?.to_vec();
+        if bytes.is_empty() {
+            return None;
+        }
+        let transactions = sniff::parse_bytes(bytes).ok()?;
+        if looks_like_schema_mismatch(&transactions) {
+            return None;
+        }
+        Some(transactions)
+    }
+
+    /// Download the native session and `charles convert` it to chlsj — the only
+    /// path that preserves WebSocket frames and decrypted bodies the JSON export
+    /// may omit.
+    async fn fetch_via_native_convert(&self) -> Result<Session, CharlesError> {
         let native = self.download_native().await?;
         let chlsj =
             convert::convert_bytes(self.config(), &native, native_ext(&native), "chlsj").await?;
@@ -289,6 +343,27 @@ fn export_get_path(exp: &EndpointSpec, format: &str) -> String {
         }
         None => exp.path.clone(),
     }
+}
+
+/// True if the session contains a WebSocket upgrade whose frames are missing —
+/// the signal that the JSON export dropped WS data and we must re-read natively.
+fn session_has_unframed_websocket(txns: &[Transaction]) -> bool {
+    txns.iter()
+        .any(|t| is_websocket_upgrade(t) && t.websocket.as_ref().is_none_or(|f| f.is_empty()))
+}
+
+/// Recognize a WebSocket upgrade from the HTTP signal alone (status 101 or an
+/// `Upgrade: websocket` header on either side), independent of whether frames
+/// were captured.
+fn is_websocket_upgrade(t: &Transaction) -> bool {
+    if t.status == Some(101) {
+        return true;
+    }
+    let upgrades = |m: &crate::session::HttpMessage| {
+        m.header("upgrade")
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+    };
+    upgrades(&t.request) || t.response.as_ref().is_some_and(upgrades)
 }
 
 /// The native session download is the modern compressed `.chlz` (a zip) on Charles
