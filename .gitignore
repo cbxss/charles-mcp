@@ -1,1 +1,8 @@
 /target
+
+# Real captured traffic — kept local, never pushed. tests/real_capture.rs
+# validates against these; a fresh clone won't have them (those tests are skipped).
+/tests/fixtures/proto_real.b64
+/tests/fixtures/ws_tesla_sent.b64
+/tests/fixtures/ws_tesla_recv.b64
+/tests/real_capture.rs

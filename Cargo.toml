@@ -12,6 +12,9 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 encoding_rs = "0.8.35"
 flate2 = "1.1.9"
 mime = "0.3.17"
+prost = { version = "0.14.4", optional = true }
+prost-reflect = { version = "0.16.4", features = ["serde"], optional = true }
+protox = { version = "0.9.1", optional = true }
 regex = "1.12.4"
 reqwest = { version = "0.13.4", features = ["gzip", "deflate", "brotli", "json", "socks", "charset", "form"] }
 rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io"] }
@@ -24,3 +27,9 @@ tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+
+[features]
+default = ["proto"]
+# Named protobuf/gRPC decoding via .proto files (pure-Rust; no protoc). The
+# schemaless decoder and gRPC framing work without this feature.
+proto = ["dep:protox", "dep:prost-reflect", "dep:prost"]

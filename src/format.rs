@@ -110,6 +110,12 @@ pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) ->
         }
         None => out.push_str("(no response captured)\n"),
     }
+    if let Some(frames) = &t.websocket {
+        out.push_str(&format!(
+            "\n── websocket ── {} frame(s); call get_websocket_messages for the decoded frames\n",
+            frames.len()
+        ));
+    }
     out
 }
 
@@ -129,6 +135,13 @@ fn render_headers(out: &mut String, headers: &[(String, String)]) {
     for (k, v) in headers {
         out.push_str(&format!("{k}: {v}\n"));
     }
+}
+
+/// Render a single decoded body to a string (used by get_websocket_messages).
+pub fn render_body_str(body: &Body) -> String {
+    let mut s = String::new();
+    render_body(&mut s, body);
+    s
 }
 
 fn render_body(out: &mut String, body: &Body) {
@@ -165,6 +178,35 @@ fn render_body(out: &mut String, body: &Body) {
                 sample_hex,
                 if *truncated { "…" } else { "" },
             ));
+        }
+        Body::Protobuf {
+            tree,
+            message_count,
+            named,
+            truncated,
+            original_len,
+        } => {
+            let kind = if *named {
+                "protobuf (named)"
+            } else {
+                "protobuf (schemaless; keys are field numbers, not names)"
+            };
+            if *message_count > 1 {
+                out.push_str(&format!("({kind}, {message_count} gRPC messages)\n"));
+            } else {
+                out.push_str(&format!("({kind})\n"));
+            }
+            out.push_str(tree);
+            if !tree.ends_with('\n') {
+                out.push('\n');
+            }
+            if *truncated {
+                out.push_str(&format!(
+                    "… [truncated: {} of {} bytes; raise max_body_bytes for more]\n",
+                    tree.len(),
+                    original_len,
+                ));
+            }
         }
     }
 }

@@ -110,6 +110,29 @@ pub struct GetRequestReq {
     /// Cap on decoded body bytes shown (defaults to the server's body limit).
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
+    /// Fully-qualified protobuf message type (e.g. "pkg.MyMessage") to decode the
+    /// body with named fields, using the server's --proto-dir. Omit for the
+    /// schemaless field-number tree.
+    #[serde(default)]
+    pub proto_type: Option<String>,
+    /// Inspect this session file instead of the live Charles session.
+    #[serde(default)]
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WsMessagesReq {
+    /// 0-based index of the WebSocket transaction (from list_requests).
+    pub index: usize,
+    /// Max frames to return (default 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Filter by direction: "sent" or "received". Omit for both.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Cap on decoded bytes per frame.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
     /// Inspect this session file instead of the live Charles session.
     #[serde(default)]
     pub file_path: Option<String>,

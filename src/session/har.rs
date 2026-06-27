@@ -126,6 +126,7 @@ fn build_request(headers: Vec<HarHeader>, post_data: Option<HarPostData>) -> Htt
         message.raw = RawBody {
             declared_charset: charset_from_content_type(mime.as_deref()),
             content_encoding: header_value(&headers, "content-encoding").map(str::to_string),
+            grpc_encoding: header_value(&headers, "grpc-encoding").map(str::to_string),
             captured: !text.is_empty(),
             bytes: text.into_bytes(),
             content_type: mime,
@@ -248,6 +249,7 @@ impl HarEntry {
             error: None,
             request,
             response: parts.message,
+            websocket: None,
         }
     }
 }

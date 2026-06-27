@@ -10,7 +10,7 @@
     "protocolVersion": "HTTP/1.1",
     "remoteAddress": "203.0.113.10",
     "clientAddress": "127.0.0.1",
-    "tlsVersion": "TLSv1.3",
+    "ssl": { "protocol": "TLSv1.3" },
     "times": { "start": "2026-01-15T10:00:00.000Z" },
     "durations": { "total": 53 },
     "request": {

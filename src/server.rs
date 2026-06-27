@@ -13,11 +13,11 @@ use regex::Regex;
 use crate::config::Config;
 use crate::error::CharlesError;
 use crate::format;
-use crate::session::{Body, Session, body, convert};
+use crate::session::{Body, Session, WsDirection, WsOpcode, body, convert};
 use crate::tools::inspect::{self, ListFilters, Matcher};
 use crate::tools::{
     ConfirmReq, ExportReq, GetRequestReq, ListRequestsReq, ReadFileReq, SearchReq, SetToolReq,
-    StatsReq, ThrottlingReq, ToolName, ToolNameReq,
+    StatsReq, ThrottlingReq, ToolName, ToolNameReq, WsMessagesReq,
 };
 use crate::web::WebClient;
 
@@ -48,13 +48,44 @@ fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, C
 #[derive(Clone)]
 pub struct CharlesServer {
     web: Arc<WebClient>,
+    /// Loaded `.proto` descriptors (from --proto-dir) for named decoding.
+    #[cfg(feature = "proto")]
+    proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
+}
+
+#[cfg(feature = "proto")]
+fn load_proto_pool(cfg: &Config) -> Option<crate::session::protobuf::ProtoPool> {
+    let dir = cfg.proto_dir.as_ref()?;
+    match crate::session::protobuf::ProtoPool::load_dir(dir) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("failed to load --proto-dir {}: {e}", dir.display());
+            None
+        }
+    }
 }
 
 impl CharlesServer {
     pub fn new(cfg: Arc<Config>) -> Result<Self, CharlesError> {
+        #[cfg(feature = "proto")]
+        let proto = Arc::new(load_proto_pool(&cfg));
+        let web = Arc::new(WebClient::new(cfg)?);
         Ok(Self {
-            web: Arc::new(WebClient::new(cfg)?),
+            web,
+            #[cfg(feature = "proto")]
+            proto,
         })
+    }
+
+    fn decode_opts<'a>(
+        &'a self,
+        proto_type: Option<&'a str>,
+    ) -> crate::session::body::DecodeOptions<'a> {
+        crate::session::body::DecodeOptions {
+            #[cfg(feature = "proto")]
+            pool: self.proto.as_ref().as_ref(),
+            proto_type,
+        }
     }
 
     fn ok(msg: impl Into<String>) -> CallToolResult {
@@ -268,15 +299,85 @@ impl CharlesServer {
         let max = req
             .max_body_bytes
             .unwrap_or(self.web.config().body_max_bytes);
-        let req_body = body::decode(&t.request.raw, max);
+        let opts = self.decode_opts(req.proto_type.as_deref());
+        let req_body = body::decode_with(&t.request.raw, max, &opts);
         let resp_body = t
             .response
             .as_ref()
-            .map(|r| body::decode(&r.raw, max))
+            .map(|r| body::decode_with(&r.raw, max, &opts))
             .unwrap_or(Body::NotCaptured);
         Ok(Self::ok(format::transaction_detail(
             t, &req_body, &resp_body,
         )))
+    }
+
+    #[tool(
+        description = "List the decoded WebSocket frames of a wss/ws transaction (by index): \
+                       direction (→ sent / ← received), opcode, and decoded payload (text/JSON, \
+                       or protobuf for binary frames). Filter by direction; cap with limit."
+    )]
+    async fn get_websocket_messages(
+        &self,
+        Parameters(req): Parameters<WsMessagesReq>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = self.resolve_session(req.file_path.as_deref()).await?;
+        let Some(t) = session.get(req.index) else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "request index {} is out of range.",
+                req.index
+            ))]));
+        };
+        let Some(frames) = &t.websocket else {
+            return Ok(Self::ok(format!(
+                "request #{} is not a WebSocket connection (no frames).",
+                req.index
+            )));
+        };
+        let max = req
+            .max_body_bytes
+            .unwrap_or(self.web.config().body_max_bytes);
+        let limit = req.limit.unwrap_or(100);
+        let want = req.direction.as_deref().map(|d| d.to_ascii_lowercase());
+        let opts = self.decode_opts(None);
+
+        let mut out = format!("{} WebSocket frame(s) in #{}\n\n", frames.len(), req.index);
+        let mut shown = 0usize;
+        for (i, m) in frames.iter().enumerate() {
+            let dir = match m.direction {
+                WsDirection::Sent => "sent",
+                WsDirection::Received => "received",
+            };
+            if want.as_deref().is_some_and(|w| w != dir) {
+                continue;
+            }
+            if shown >= limit {
+                out.push_str(&format!(
+                    "… ({} more frames; raise limit)\n",
+                    frames.len() - i
+                ));
+                break;
+            }
+            shown += 1;
+            let arrow = if dir == "sent" { "→" } else { "←" };
+            out.push_str(&format!("[{i}] {arrow} {:?}\n", m.opcode));
+            // Binary WS frames are often protobuf (MQTT/Tesla signaling, etc.) —
+            // try a schemaless decode before falling back to text/hex.
+            if matches!(m.opcode, WsOpcode::Binary)
+                && let Some((tree, _)) =
+                    crate::session::protobuf::try_decode(&m.payload.bytes, &opts)
+            {
+                out.push_str("(protobuf, schemaless)\n");
+                out.push_str(&tree);
+                if !tree.ends_with('\n') {
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(&format::render_body_str(&body::decode_with(
+                    &m.payload, max, &opts,
+                )));
+            }
+        }
+        Ok(Self::ok(out))
     }
 
     #[tool(

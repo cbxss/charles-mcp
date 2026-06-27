@@ -6,9 +6,24 @@
 
 use std::io::Read;
 
-use super::{Body, RawBody, charset_from_content_type};
+use super::{Body, RawBody, charset_from_content_type, grpc, protobuf};
 
+/// Options threaded into [`decode_with`] for named protobuf decoding.
+#[derive(Default, Clone, Copy)]
+pub struct DecodeOptions<'a> {
+    /// Loaded `.proto` descriptors for named decode, if any.
+    #[cfg(feature = "proto")]
+    pub pool: Option<&'a protobuf::ProtoPool>,
+    /// Fully-qualified message type to decode against (named).
+    pub proto_type: Option<&'a str>,
+}
+
+/// Decode a captured body (schemaless protobuf included; no `.proto` needed).
 pub fn decode(raw: &RawBody, max_bytes: usize) -> Body {
+    decode_with(raw, max_bytes, &DecodeOptions::default())
+}
+
+pub fn decode_with(raw: &RawBody, max_bytes: usize, opts: &DecodeOptions) -> Body {
     if !raw.captured {
         return Body::NotCaptured;
     }
@@ -18,6 +33,17 @@ pub fn decode(raw: &RawBody, max_bytes: usize) -> Body {
 
     let decompressed = decompress(&raw.bytes, raw.content_encoding.as_deref());
     let bytes: &[u8] = decompressed.as_deref().unwrap_or(&raw.bytes);
+
+    // Protobuf / gRPC decode, before the generic binary path. On any failure we
+    // fall through to the existing is_binary → Binary(hex) handling.
+    if let Some(ct) = raw.content_type.as_deref() {
+        let ctl = ct.to_ascii_lowercase();
+        if (grpc::is_grpc_ct(&ctl) || grpc::is_protobuf_ct(&ctl))
+            && let Some(body) = decode_protobuf(bytes, raw, &ctl, max_bytes, opts)
+        {
+            return body;
+        }
+    }
 
     if is_binary(bytes, raw.content_type.as_deref()) {
         let sample_len = bytes.len().min(64);
@@ -52,6 +78,65 @@ pub fn decode(raw: &RawBody, max_bytes: usize) -> Body {
         truncated,
         original_len,
     }
+}
+
+/// Orchestrate protobuf/gRPC decoding: split gRPC frames (or treat the whole
+/// body as one bare-protobuf message), decode each via `protobuf::try_decode`,
+/// and join into a `Body::Protobuf`. `None` ⇒ caller falls back to hex.
+fn decode_protobuf(
+    bytes: &[u8],
+    raw: &RawBody,
+    ctl: &str,
+    max_bytes: usize,
+    opts: &DecodeOptions,
+) -> Option<Body> {
+    let payloads: Vec<Vec<u8>> = if grpc::is_grpc_ct(ctl) {
+        let frames = grpc::split_frames(bytes, grpc::is_grpc_web_text_ct(ctl))?;
+        let mut out = Vec::new();
+        for f in &frames {
+            if f.flags & 0x80 != 0 {
+                continue; // gRPC-Web trailers frame — not protobuf
+            }
+            out.push(
+                grpc::decompress_frame(f, raw.grpc_encoding.as_deref())
+                    .unwrap_or_else(|| f.data.clone()),
+            );
+        }
+        if out.is_empty() {
+            return None;
+        }
+        out
+    } else {
+        vec![bytes.to_vec()]
+    };
+
+    let count = payloads.len();
+    let mut tree = String::new();
+    let mut named = false;
+    for (i, payload) in payloads.iter().enumerate() {
+        let (rendered, was_named) = protobuf::try_decode(payload, opts)?;
+        named |= was_named;
+        if count > 1 {
+            tree.push_str(&format!("── message {} ──\n", i + 1));
+        }
+        tree.push_str(&rendered);
+        if !tree.ends_with('\n') {
+            tree.push('\n');
+        }
+    }
+
+    let original_len = tree.len() as u64;
+    let truncated = tree.len() > max_bytes;
+    if truncated {
+        tree = truncate_str(&tree, max_bytes);
+    }
+    Some(Body::Protobuf {
+        tree,
+        message_count: count,
+        named,
+        truncated,
+        original_len,
+    })
 }
 
 /// Decompress per `Content-Encoding`. Returns `None` when no decompression is

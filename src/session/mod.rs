@@ -4,8 +4,11 @@
 pub mod body;
 pub mod chlsj;
 pub mod convert;
+pub mod grpc;
 pub mod har;
+pub mod protobuf;
 pub mod sniff;
+pub mod websocket;
 
 use std::path::PathBuf;
 
@@ -59,10 +62,43 @@ pub struct Transaction {
     /// content. Surfaced so the agent isn't misled into thinking the body was
     /// simply "not captured".
     pub tunnel: bool,
-    /// Set when the transaction failed/was aborted (chlsj session state).
+    /// Set when the transaction failed/was aborted (chlsj `errorMessage`/state).
     pub error: Option<String>,
     pub request: HttpMessage,
     pub response: Option<HttpMessage>,
+    /// WebSocket frames (when this transaction is a `wss`/`ws` connection).
+    /// `None` for ordinary HTTP transactions.
+    pub websocket: Option<Vec<WsMessage>>,
+}
+
+/// Direction of a captured WebSocket message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsDirection {
+    /// client → server (these frames are masked on the wire).
+    Sent,
+    /// server → client (unmasked).
+    Received,
+}
+
+/// WebSocket frame opcode (RFC 6455).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsOpcode {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+    /// Any other/continuation opcode value.
+    Other(u8),
+}
+
+/// One reassembled WebSocket message.
+#[derive(Debug, Clone)]
+pub struct WsMessage {
+    pub direction: WsDirection,
+    pub opcode: WsOpcode,
+    /// Decoded payload (text/binary/protobuf decided by [`body::decode`]).
+    pub payload: RawBody,
 }
 
 impl Transaction {
@@ -105,6 +141,9 @@ pub struct RawBody {
     pub was_base64_wrapped: bool,
     /// False when Charles recorded that the body was not stored.
     pub captured: bool,
+    /// The `grpc-encoding` header (gzip/deflate/identity) for per-message gRPC
+    /// frame decompression — distinct from the HTTP `content_encoding`.
+    pub grpc_encoding: Option<String>,
 }
 
 /// Presentation form of a body, produced on demand for `get_request`.
@@ -122,6 +161,17 @@ pub enum Body {
         bytes_len: u64,
         sample_hex: String,
         truncated: bool,
+    },
+    /// Decoded protobuf / gRPC body, rendered as an indented tree (schemaless)
+    /// or pretty JSON (named via a `.proto`).
+    Protobuf {
+        tree: String,
+        /// >1 for a gRPC stream; 1 for a bare protobuf body.
+        message_count: usize,
+        /// True when decoded against a `.proto` type (named fields).
+        named: bool,
+        truncated: bool,
+        original_len: u64,
     },
 }
 

@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    HttpMessage, RawBody, Transaction, charset_from_content_type, decode_base64, header_value,
-    mime_essence,
+    HttpMessage, RawBody, Transaction, WsDirection, charset_from_content_type, decode_base64,
+    header_value, mime_essence, websocket,
 };
 use crate::error::CharlesError;
 
@@ -52,8 +52,12 @@ struct ChlsTxn {
     remote_address: Option<String>,
     #[serde(default, rename = "clientAddress")]
     client_address: Option<String>,
-    #[serde(default, rename = "tlsVersion")]
-    tls_version: Option<String>,
+    /// TLS info lives under `ssl: { protocol }` in real Charles output.
+    #[serde(default)]
+    ssl: Option<ChlsSsl>,
+    /// Human-readable failure message (e.g. "SSL handshake with client failed…").
+    #[serde(default, rename = "errorMessage")]
+    error_message: Option<String>,
     #[serde(default)]
     times: Option<Value>,
     #[serde(default)]
@@ -66,6 +70,16 @@ struct ChlsTxn {
     /// Proxying not enabled for the host) — the body is ciphertext.
     #[serde(default)]
     tunnel: bool,
+    /// True when this is a WebSocket connection; frames are the request/response
+    /// bodies (raw RFC 6455, base64).
+    #[serde(default, rename = "webSocket")]
+    web_socket: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct ChlsSsl {
+    #[serde(default)]
+    protocol: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -232,12 +246,28 @@ impl ChlsTxn {
             msg
         });
 
-        let session_state = self.status;
-        let error = session_state
-            .as_deref()
-            .filter(|s| is_failed_state(s))
-            .map(str::to_string);
+        // Prefer Charles's human-readable errorMessage; fall back to the state.
+        let error = self.error_message.clone().or_else(|| {
+            self.status
+                .as_deref()
+                .filter(|s| is_failed_state(s))
+                .map(str::to_string)
+        });
 
+        // For a WebSocket connection the request/response bodies are the raw
+        // RFC 6455 frame streams (sent = masked, received = unmasked).
+        let websocket = self.web_socket.then(|| {
+            let mut msgs = websocket::parse_messages(&request.raw.bytes, WsDirection::Sent);
+            if let Some(resp) = &response {
+                msgs.extend(websocket::parse_messages(
+                    &resp.raw.bytes,
+                    WsDirection::Received,
+                ));
+            }
+            msgs
+        });
+
+        let tls_version = self.ssl.and_then(|s| s.protocol);
         let started = self.times.as_ref().and_then(parse_time_start);
         let duration_ms = self.durations.as_ref().and_then(|d| get_f64(d, "total"));
 
@@ -257,11 +287,12 @@ impl ChlsTxn {
             protocol: self.protocol_version,
             client_addr: self.client_address,
             remote_addr: self.remote_address,
-            tls_version: self.tls_version,
+            tls_version,
             tunnel: self.tunnel,
             error,
             request,
             response,
+            websocket,
         }
     }
 }

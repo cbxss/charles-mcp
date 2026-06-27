@@ -31,6 +31,7 @@ fn raw(bytes: Vec<u8>, ce: Option<&str>, ct: Option<&str>) -> RawBody {
         declared_charset: None,
         was_base64_wrapped: false,
         captured: true,
+        grpc_encoding: None,
     }
 }
 

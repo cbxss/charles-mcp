@@ -178,10 +178,15 @@ fn search_body(matcher: &Matcher, t: &Transaction) -> Option<String> {
     const SEARCH_CAP: usize = 1 << 20;
     let texts = [Some(&t.request), t.response.as_ref()];
     for msg in texts.into_iter().flatten() {
-        if let Body::Text { text, .. } = body::decode(&msg.raw, SEARCH_CAP)
-            && let Some(pos) = matcher.find(&text)
+        let hay = match body::decode(&msg.raw, SEARCH_CAP) {
+            Body::Text { text, .. } => Some(text),
+            Body::Protobuf { tree, .. } => Some(tree),
+            _ => None,
+        };
+        if let Some(hay) = hay
+            && let Some(pos) = matcher.find(&hay)
         {
-            return Some(snippet(&text, pos));
+            return Some(snippet(&hay, pos));
         }
     }
     None

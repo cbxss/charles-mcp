@@ -30,7 +30,9 @@ That's it — defaults assume Charles on `127.0.0.1:8888`. Ask the agent to run 
 
 **Control:** `charles_status` · `start_recording` · `stop_recording` · `set_throttling` · `set_tool` · `get_tool_status` · `clear_session`\* · `quit_charles`\*  (\* destructive — need `confirm: true`)
 
-**Inspect** (live session, or pass `file_path` for a saved file): `list_requests` · `get_request` · `search_traffic` · `get_session_stats` · `export_session` · `read_session_file`
+**Inspect** (live session, or pass `file_path` for a saved file): `list_requests` · `get_request` · `search_traffic` · `get_session_stats` · `export_session` · `read_session_file` · `get_websocket_messages`
+
+Bodies are decoded automatically: gzip/brotli/base64, JSON pretty-printed, **protobuf/gRPC → a field tree** (schemaless, or named with `--proto-dir`), and **WebSocket frames** (RFC 6455, incl. protobuf-over-WS) via `get_websocket_messages`.
 
 ## Configuration (optional)
 
@@ -43,6 +45,7 @@ Every flag has an env-var fallback; precedence is **CLI flag > env var > default
 | `--web-user` / `--web-pass` | _(none)_ | Web Interface basic auth, if you set one |
 | `--charles-bin` / `CHARLES_BIN` | `/Applications/Charles.app/Contents/MacOS/Charles` | used to convert `.chls` files |
 | `--body-max-bytes` / `CHARLES_BODY_MAX_BYTES` | `8192` | max decoded body bytes returned by `get_request` |
+| `--proto-dir` / `CHARLES_PROTO_DIR` | _(none)_ | dir of `.proto` files for named protobuf/gRPC decoding (build with default feature `proto`) |
 
 Set `CHARLES_LOG=debug` for verbose logs (written to stderr, never the stdio transport).
 
@@ -60,7 +63,7 @@ charles-mcp ──HTTP──▶ Charles proxy (127.0.0.1:8888) ──internal─
 - **`set_tool` toggles master switches only.** `map-*`, `rewrite`, `*-list`, and `dns-spoofing` do nothing without **rules** (GUI-only; not managed here). **`breakpoints` will pause/hang matching traffic** waiting for manual action in Charles — this server can't respond to breakpoints. Both cases are called out in the tool output.
 - **Live inspection re-exports the session** (cached for `--cache-ttl-ms`, default 5s, which also keeps indices stable in a burst). Large sessions can be slow or hit `--timeout-ms`.
 - **`charles convert`** runs the Charles binary; it can collide with a running instance. Bounded by `--convert-timeout-ms`.
-- WebSockets/gRPC/protobuf bodies aren't decoded; they show as binary.
+- WebSockets, gRPC, and protobuf **are** decoded now (frames / field trees). Schemaless protobuf needs no `.proto`; point `--proto-dir` at `.proto` files and pass `proto_type` to `get_request` for named fields.
 
 ## Note: provisional schema ⚠️
 

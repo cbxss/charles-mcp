@@ -66,6 +66,11 @@ pub struct Config {
     /// Preferred format when fetching/exporting the live session.
     #[arg(long, env = "CHARLES_EXPORT_FORMAT", default_value = "chlsj")]
     pub default_export_format: String,
+
+    /// Directory of `.proto` files for NAMED protobuf/gRPC field decoding
+    /// (optional; schemaless decoding works without it).
+    #[arg(long, env = "CHARLES_PROTO_DIR")]
+    pub proto_dir: Option<PathBuf>,
 }
 
 impl Config {
