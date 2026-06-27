@@ -49,6 +49,7 @@ pub struct CharlesServer {
     web: Arc<WebClient>,
     store: Arc<TrafficStore>,
     live: Arc<Mutex<Option<(Instant, CaptureRef)>>>,
+    live_watermark: Arc<Mutex<usize>>,
     #[cfg(feature = "proto")]
     proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
 }
@@ -75,6 +76,7 @@ impl CharlesServer {
             web,
             store,
             live: Arc::new(Mutex::new(None)),
+            live_watermark: Arc::new(Mutex::new(0)),
             #[cfg(feature = "proto")]
             proto,
         })
@@ -89,6 +91,15 @@ impl CharlesServer {
         tokio::task::spawn_blocking(move || f(&store))
             .await
             .map_err(|e| CharlesError::Parse(format!("store task failed: {e}")))?
+    }
+
+    async fn live_count(&self) -> usize {
+        self.live
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, c)| c.entry_count)
+            .unwrap_or(0)
     }
 
     fn decode_opts<'a>(
@@ -222,10 +233,10 @@ impl CharlesServer {
 
     #[tool(
         description = "Enable or disable bandwidth throttling, optionally selecting a preset. The \
-                       preset must exactly match a name configured in Charles (Proxy → Throttle \
-                       Settings; defaults include \"3G\", \"4G\", \"56 kbps Modem\"). Charles \
-                       silently ignores an unknown preset, and this server can't verify it took \
-                       effect — confirm in the Charles UI if unsure."
+                       preset is validated against the names configured in Charles (Proxy → \
+                       Throttle Settings) — an unknown name returns an error listing the real \
+                       presets. Call get_throttling to see them. Omit the preset to use the \
+                       current one."
     )]
     async fn set_throttling(
         &self,
@@ -243,17 +254,45 @@ impl CharlesServer {
     }
 
     #[tool(
+        description = "Report whether bandwidth throttling is active and list the preset names \
+                       configured in Charles (Proxy → Throttle Settings) that set_throttling will \
+                       accept."
+    )]
+    async fn get_throttling(&self) -> Result<CallToolResult, ErrorData> {
+        let info = self.web.throttle_info().await?;
+        let presets = if info.presets.is_empty() {
+            "(none configured)".to_string()
+        } else {
+            info.presets.join(", ")
+        };
+        Ok(Self::ok(format!(
+            "Throttling: {}\nConfigured presets: {presets}",
+            if info.active { "ACTIVE" } else { "stopped" },
+        )))
+    }
+
+    #[tool(
         description = "Enable/disable a Charles tool's master switch: breakpoints, no-caching, \
-                       block-cookies, map-remote, map-local, rewrite, black-list, white-list, \
-                       dns-spoofing, auto-save, client-process. NOTE: the rule-based tools \
-                       (map-*, rewrite, *-list, dns-spoofing) do nothing without rules configured \
-                       in the Charles GUI — this server cannot manage rules — and breakpoints will \
-                       pause/hang matching traffic. See the per-call notes."
+                       block-cookies, map-remote, map-local, rewrite, block-list, allow-list, \
+                       dns-spoofing, auto-save, client-process. The rule-based tools (map-*, \
+                       rewrite, block-list/allow-list, dns-spoofing) are no-ops without rules — \
+                       rules are GUI-only, the Web Interface exposes no rule management. Enabling \
+                       breakpoints requires confirm=true: it PAUSES matching traffic in the Charles \
+                       GUI and this server cannot release it, so traffic can hang."
     )]
     async fn set_tool(
         &self,
         Parameters(req): Parameters<SetToolReq>,
     ) -> Result<CallToolResult, ErrorData> {
+        if matches!(req.tool, ToolName::Breakpoints) && req.enabled && !req.confirm {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "refusing to enable breakpoints without confirm=true: Charles will PAUSE matching \
+                 requests waiting for manual Edit/Execute/Abort in its GUI, and this server cannot \
+                 respond to breakpoints — live traffic can hang with no way to release it from \
+                 here. Re-call with confirm=true if you understand this."
+                    .to_string(),
+            )]));
+        }
         self.web.set_tool(req.tool.to_web(), req.enabled).await?;
         let mut msg = format!(
             "Tool {:?} {}.",
@@ -270,11 +309,11 @@ impl CharlesServer {
                 ToolName::MapRemote
                 | ToolName::MapLocal
                 | ToolName::Rewrite
-                | ToolName::BlackList
-                | ToolName::WhiteList
+                | ToolName::BlockList
+                | ToolName::AllowList
                 | ToolName::DnsSpoofing => msg.push_str(
-                    " Note: this only affects traffic if matching rules exist (configured in the \
-                     Charles GUI — this server can't add rules). With no rules it's a no-op.",
+                    " Note: this only affects traffic if matching rules exist (GUI-only; this \
+                     server can't add rules). With no rules it's a no-op.",
                 ),
                 _ => {}
             }
@@ -321,15 +360,19 @@ impl CharlesServer {
     }
 
     #[tool(
-        description = "Browse/filter captured requests by host, method, status, path_regex, or \
-                       mime -> a compact table of indices. Use search_traffic for full-text/body \
-                       search; get_request for one request's full detail. Live session unless \
-                       file_path (.har/.chlsj/.chls) is given."
+        description = "Browse/filter captured requests (host, method, status, path_regex, mime, \
+                       resource_class, min_priority) -> a compact table sorted by priority, each \
+                       row tagged with its resource class. only_new=true returns just the requests \
+                       that arrived since your last list_requests call (live tail; pair with host \
+                       for a per-host watch). Use search_traffic for full-text/body search; \
+                       get_request for one request's full detail. Live session unless file_path \
+                       (.har/.chlsj/.chls) is given."
     )]
     async fn list_requests(
         &self,
         Parameters(req): Parameters<ListRequestsReq>,
     ) -> Result<CallToolResult, ErrorData> {
+        let is_live = req.file_path.is_none();
         let capture = self.ensure_capture(req.file_path.as_deref()).await?;
         let path_regex = match req.path_regex.as_deref() {
             Some(p) => Some(
@@ -338,6 +381,13 @@ impl CharlesServer {
             ),
             None => None,
         };
+        let live_count = if is_live { self.live_count().await } else { 0 };
+        let min_seq = if is_live && req.only_new {
+            let watermark = (*self.live_watermark.lock().await).min(live_count);
+            Some(watermark as i64)
+        } else {
+            None
+        };
         let filters = StoreFilters {
             host: req.host.clone(),
             method: req.method.clone(),
@@ -345,11 +395,15 @@ impl CharlesServer {
             mime: req.mime.clone(),
             resource_class: req.resource_class.clone(),
             min_priority: req.min_priority,
+            min_seq,
             path_regex,
             limit: req.limit.unwrap_or(50),
         };
         let cid = capture.clone();
         let (rows, total) = self.blocking(move |s| s.list(&cid, &filters)).await?;
+        if is_live {
+            *self.live_watermark.lock().await = live_count;
+        }
         let truncated = total > rows.len();
         let header = format!(
             "requests: {} total, {} shown{} (sorted by priority). Pass a row's # to get_request.\n",
@@ -625,6 +679,7 @@ impl CharlesServer {
         }
         self.web.clear_session().await?;
         *self.live.lock().await = None;
+        *self.live_watermark.lock().await = 0;
         Ok(Self::ok("Session cleared."))
     }
 
@@ -644,6 +699,7 @@ impl CharlesServer {
         }
         self.blocking(|s| s.reset()).await?;
         *self.live.lock().await = None;
+        *self.live_watermark.lock().await = 0;
         Ok(Self::ok("Traffic store reset."))
     }
 

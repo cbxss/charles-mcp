@@ -220,3 +220,63 @@ fn empty_but_captured_body_reconstructs_without_a_body_row() {
     assert!(resp.raw.bytes.is_empty());
     assert!(resp.raw.captured);
 }
+
+#[test]
+fn min_seq_filters_to_the_tail() {
+    let store = TrafficStore::open(None).unwrap();
+    store
+        .ingest(
+            "live",
+            "live",
+            None,
+            None,
+            &live(vec![
+                txn(0, "a", Some(200), b"x"),
+                txn(1, "b", Some(200), b"x"),
+                txn(2, "c", Some(200), b"x"),
+                txn(3, "d", Some(200), b"x"),
+                txn(4, "e", Some(200), b"x"),
+            ]),
+            4096,
+        )
+        .unwrap();
+
+    let (rows, total) = store
+        .list(
+            "live",
+            &StoreFilters {
+                min_seq: Some(3),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(total, 2, "only seq >= 3 survives min_seq");
+    assert!(
+        rows.iter().all(|r| r.seq >= 3),
+        "every returned row is at or past min_seq"
+    );
+    let seqs: std::collections::HashSet<usize> = rows.iter().map(|r| r.seq).collect();
+    assert_eq!(
+        seqs,
+        std::collections::HashSet::from([3, 4]),
+        "the tail is exactly seqs 3 and 4"
+    );
+
+    let (_, all_via_zero) = store
+        .list(
+            "live",
+            &StoreFilters {
+                min_seq: Some(0),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(all_via_zero, 5, "min_seq of 0 keeps every entry");
+    let (_, all_via_none) = store.list("live", &filters(50)).unwrap();
+    assert_eq!(
+        all_via_none, 5,
+        "absent min_seq is additive, not restrictive"
+    );
+}

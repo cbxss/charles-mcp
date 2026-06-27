@@ -44,16 +44,16 @@ remains is a handful of edge conditions and feature work, marked below.
 
 - [x] **`charles convert` invocation — works** with the default `/Applications/Charles.app/Contents/MacOS/Charles convert in out`, **including while Charles is already running** (no single-instance collision); the gated `convert_real.rs` tests pass against the live install. Not exercised: a trial/unregistered copy's license nag (still relies on `--convert-timeout-ms`).
 
-- [x] **Control verbs end-to-end — confirmed live.** `start_recording`/`stop_recording`, `set_throttling` activate/deactivate, and `set_tool` toggle all return success against real Charles 5.
+- [x] **Control verbs end-to-end — confirmed live.** `start_recording`/`stop_recording`, `set_throttling` activate/deactivate, and `set_tool` toggle all return success against real Charles 5. **Bug fix:** the `set_tool`/`get_tool_status` segments `black-list`/`white-list` were wrong (they hit a 404 and never worked) — renamed to the real Charles 5 `block-list`/`allow-list`.
   - Files: `src/web/control.rs`.
 
 - [x] **`get_tool_status` parsing — confirmed live.** Round-tripped `block-cookies` disabled → enabled → disabled and read the `Status:` marker back correctly each time (proves `set_tool` takes effect *and* the parse heuristic holds).
   - Files: `get_tool_status` in `src/web/control.rs`.
 
-- [ ] **Throttling presets.** `set_throttling` on/off confirmed live; still: confirm a named preset takes effect, and consider reading back / enumerating configured presets so `set_throttling` can validate the name instead of silently succeeding.
+- [x] **Throttling presets — DONE.** `set_throttling` now scrapes the configured presets from the `throttling/` page and **validates** the `preset` against them (an unknown name returns an error listing the real presets instead of silently succeeding); new read tool **`get_throttling`** reports whether throttling is active plus the available presets.
   - Files: `set_throttling` in `src/web/control.rs`, description in `src/server.rs`.
 
-- [ ] **Auth realm / anonymous.** Anonymous-access reporting confirmed live (`charles_status` → "anonymous access"). Still: verify the basic-auth realm and the authenticated path with credentials set.
+- [x] **Auth realm / anonymous — DONE.** Anonymous-access reporting confirmed live (`charles_status` → "anonymous access"); the basic-auth **realm** is now parsed from `WWW-Authenticate` on a 401 and surfaced in `charles_status`.
   - Files: `WebClient::status`, `raw_request`/`send_control` in `src/web/{mod,live}.rs`.
 
 - [ ] **Performance on a real (hundreds-of-MB) session.** Partly addressed: the SQLite store ingests once and queries from SQL/FTS (no re-parse per call), `--export-timeout-ms` separates the whole-session read from per-request timeouts, and the server's own `control.charles` reads are dropped from the session by default (`--include-control-traffic` to keep them) — confirmed live that repeated `/session/export-json` reads otherwise nest and the session balloons exponentially (66 KB → 80 MB over a few reads). Still to do live: measure export+convert cost, tune `--cache-ttl-ms`, check for a delta/`since` export param, consider a streaming parse instead of whole-session-in-RAM, and document the Charles-side recording filter that excludes `control.charles` at the source.
@@ -61,10 +61,10 @@ remains is a handful of edge conditions and feature work, marked below.
 
 ## P2 — capabilities a Charles power user expects (feature work, not bugs)
 
-- [ ] Respond to **breakpoints** (intercept → edit → Execute/Abort). Today enabling breakpoints can hang traffic with no way to release it. The Web Interface exposes no breakpoint-response endpoint, so this likely needs a different integration path.
+- [~] Respond to **breakpoints** (intercept → edit → Execute/Abort) — **won't-do / infeasible via the supported API.** Confirmed live: the Charles Web Interface exposes no breakpoint queue/response (only the tool's Status + enable/disable), so this can't be done here. Mitigation shipped: `set_tool(breakpoints, enable)` now requires `confirm: true` (it hangs matching traffic with no way to release it), and the tool description says so.
 - [x] **Compose / Repeat / Repeat Advanced** — delivered by `replay_request` (re-issue a captured request with query/header/json/body overrides, mutating-gated) and **live-validated** (replayed a real GET → 200 with baseline diff). (Still open: "get request as curl/raw".)
-- [ ] **Rule management** for Map Local / Map Remote / Rewrite / Breakpoints (the master-switch toggles are no-ops without rules).
-- [ ] **Live tail / Focus / per-host watch** without re-exporting the whole session.
+- [~] **Rule management** for Map Local / Map Remote / Rewrite / Breakpoints — **won't-do / infeasible via the supported API.** Confirmed live: the Web Interface exposes no rule CRUD (only each tool's Status + enable/disable), so the master-switch toggles stay no-ops without GUI rules. Tool descriptions now say rules are GUI-only.
+- [x] **Live tail / Focus / per-host watch — DONE** (`list_requests(only_new: true)` + the existing `host`/`resource_class`/`min_priority` filters: a server-side watermark returns just the requests that arrived since your last call). Caveat: it still re-exports the whole session under the hood, since Charles has no delta/`since` export endpoint.
 
 ---
 

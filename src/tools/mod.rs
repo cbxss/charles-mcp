@@ -16,8 +16,8 @@ pub enum ToolName {
     MapRemote,
     MapLocal,
     Rewrite,
-    BlackList,
-    WhiteList,
+    BlockList,
+    AllowList,
     DnsSpoofing,
     AutoSave,
     ClientProcess,
@@ -32,8 +32,8 @@ impl ToolName {
             ToolName::MapRemote => CharlesTool::MapRemote,
             ToolName::MapLocal => CharlesTool::MapLocal,
             ToolName::Rewrite => CharlesTool::Rewrite,
-            ToolName::BlackList => CharlesTool::BlackList,
-            ToolName::WhiteList => CharlesTool::WhiteList,
+            ToolName::BlockList => CharlesTool::BlockList,
+            ToolName::AllowList => CharlesTool::AllowList,
             ToolName::DnsSpoofing => CharlesTool::DnsSpoofing,
             ToolName::AutoSave => CharlesTool::AutoSave,
             ToolName::ClientProcess => CharlesTool::ClientProcess,
@@ -52,6 +52,8 @@ pub struct ThrottlingReq {
 pub struct SetToolReq {
     pub tool: ToolName,
     pub enabled: bool,
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -90,6 +92,8 @@ pub struct ListRequestsReq {
     pub resource_class: Option<String>,
     #[serde(default)]
     pub min_priority: Option<i64>,
+    #[serde(default)]
+    pub only_new: bool,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]

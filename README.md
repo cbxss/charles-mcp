@@ -30,13 +30,13 @@ Defaults assume Charles on `127.0.0.1:8888`. Ask the agent to run **`charles_sta
 
 ## Tools
 
-**Control:** `charles_status` · `start_recording` · `stop_recording` · `set_throttling` · `set_tool` · `get_tool_status` · `clear_session`\* · `quit_charles`\* · `reset_store`\*  (\* destructive — need `confirm: true`)
+**Control:** `charles_status` · `start_recording` · `stop_recording` · `set_throttling` · `get_throttling` · `set_tool` · `get_tool_status` · `clear_session`\* · `quit_charles`\* · `reset_store`\*  (\* destructive — need `confirm: true`; `set_tool(breakpoints, enabled)` also needs `confirm: true`, since it can hang traffic)
 
 **Inspect** (live session, or pass `file_path` for a saved file): `list_requests` · `get_request` · `search_traffic` · `get_session_stats` · `replay_request` · `export_session` · `read_session_file` · `get_websocket_messages`
 
 Bodies decode automatically: gzip/brotli/base64, JSON pretty-printed, **protobuf/gRPC → a field tree** (schemaless, or named with `--proto-dir`), and **WebSocket frames** (RFC 6455, incl. protobuf-over-WS) via `get_websocket_messages`.
 
-- **`list_requests`** sorts by a priority score and tags each row with a *resource class* (api_candidate / document / script / static_asset / …), so API and error traffic surfaces above asset noise. Filter with `resource_class`, `min_priority`, `host`, `method`, `status`, `path_regex`, or `mime`.
+- **`list_requests`** sorts by a priority score and tags each row with a *resource class* (api_candidate / document / script / static_asset / …), so API and error traffic surfaces above asset noise. Filter with `resource_class`, `min_priority`, `host`, `method`, `status`, `path_regex`, or `mime`. Pass `only_new: true` for a live tail — just the requests that arrived since your last call (a server-side watermark); it still re-exports the whole session under the hood (Charles has no delta endpoint), so pair it with `host`/`resource_class`/`min_priority` for a focused, per-host watch.
 - **`search_traffic`** is FTS5 full-text over URLs, headers, and **decoded** bodies (including protobuf field trees); pass `regex: true` for a decoded-body regex scan instead.
 - **`replay_request`** re-issues a captured request to its origin and shows the decoded response + a baseline diff. Safe by default: `confirm: true` to send, plus `allow_mutating: true` for POST/PUT/PATCH/DELETE. The target host is fixed to the capture (no host override) and the proxy is off unless `use_proxy: true`. Override query params, headers, a JSON body, or the raw body.
 
@@ -77,7 +77,7 @@ charles-mcp ──HTTP──▶ Charles proxy (127.0.0.1:8888) ──internal─
 ## Limitations
 
 - **HTTPS needs SSL Proxying.** Charles only decrypts a host's HTTPS if you've enabled **Proxy → SSL Proxying** for it. Undecrypted requests are CONNECT tunnels; the server flags them (`⚠ HTTPS tunnel — not decrypted`) rather than pretending the body is missing.
-- **`set_tool` toggles master switches only.** `map-*`, `rewrite`, `*-list`, and `dns-spoofing` do nothing without **rules** (GUI-only; not managed here). **`breakpoints` pauses/hangs matching traffic** waiting for manual action in Charles, which this server can't supply. Both cases are called out in the tool output.
+- **`set_tool` toggles master switches only.** The Charles Web Interface exposes **no rule management and no breakpoint queue/response** — only each tool's Status plus enable/disable. So `map-*`, `rewrite`, `*-list`, and `dns-spoofing` are no-ops without **rules** (GUI-only; not managed here), and enabling `breakpoints` pauses/hangs matching traffic with no way to release it here (hence the required `confirm: true`). Both cases are called out in the tool output.
 - **Live inspection reads the session once and ingests it,** refreshed every `--cache-ttl-ms` (also keeps indices stable in a burst). The read uses Charles's `/session/export-json`; a session with WebSocket frames falls back to a native download + `charles convert`, since the JSON export omits WS frames. Bounded by `--export-timeout-ms`. The server's own `control.charles` requests are dropped from the session by default (`--include-control-traffic` to keep them) — Charles records them, and each export-json read otherwise nests the previous one, so the session balloons. To stop Charles recording them at the source, add a recording filter excluding `control.charles`.
 - **`charles convert`** runs the Charles binary and can collide with a running instance. Bounded by `--convert-timeout-ms`.
 - **The SQLite store is ephemeral by default** (in-memory; gone on exit). Set `--db-path` to persist captures; `reset_store` (with `confirm: true`) drops everything.

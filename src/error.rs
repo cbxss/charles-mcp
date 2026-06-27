@@ -17,7 +17,7 @@ pub enum CharlesError {
     #[error(
         "the Charles Web Interface requires authentication (set --web-user/--web-pass) or the credentials are wrong"
     )]
-    Unauthorized,
+    Unauthorized { realm: Option<String> },
 
     #[error(
         "Charles returned HTTP {status} for `{path}`; verify the Web Interface is enabled and this \
@@ -67,7 +67,7 @@ impl From<CharlesError> for ErrorData {
         use CharlesError::*;
         match e {
             Unreachable { .. }
-            | Unauthorized
+            | Unauthorized { .. }
             | HttpStatus { .. }
             | EndpointNotFound(_)
             | CharlesBinMissing(_)

@@ -58,6 +58,7 @@ pub struct StoreFilters {
     pub mime: Option<String>,
     pub resource_class: Option<String>,
     pub min_priority: Option<i64>,
+    pub min_seq: Option<i64>,
     pub path_regex: Option<Regex>,
     pub limit: usize,
 }
@@ -205,6 +206,10 @@ impl TrafficStore {
         if let Some(mp) = f.min_priority {
             p.push(Value::Integer(mp));
             sql.push_str(&format!(" AND priority >= ?{}", p.len()));
+        }
+        if let Some(ms) = f.min_seq {
+            p.push(Value::Integer(ms));
+            sql.push_str(&format!(" AND seq >= ?{}", p.len()));
         }
         sql.push_str(" ORDER BY priority DESC, seq");
 

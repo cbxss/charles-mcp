@@ -79,7 +79,9 @@ impl WebClient {
         let resp = req.send().await.map_err(|e| self.connect_err(e))?;
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED {
-            return Err(CharlesError::Unauthorized);
+            return Err(CharlesError::Unauthorized {
+                realm: realm_from(&resp),
+            });
         }
         if !status.is_success() {
             return Err(CharlesError::HttpStatus {
@@ -123,12 +125,14 @@ impl WebClient {
                     ..base
                 }
             }
-            Err(CharlesError::Unauthorized) => StatusReport {
+            Err(CharlesError::Unauthorized { realm }) => StatusReport {
                 reachable: true,
                 authenticated: false,
-                note: "Proxy reachable but the Web Interface needs credentials \
-                       (set --web-user/--web-pass)."
-                    .into(),
+                note: format!(
+                    "Proxy reachable but the Web Interface needs credentials{} \
+                     (set --web-user/--web-pass).",
+                    realm.map(|r| format!(" (realm {r:?})")).unwrap_or_default()
+                ),
                 ..base
             },
             Err(CharlesError::HttpStatus { status, .. }) => StatusReport {
@@ -157,4 +161,17 @@ impl WebClient {
             },
         }
     }
+}
+
+fn realm_from(resp: &reqwest::Response) -> Option<String> {
+    let v = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .to_str()
+        .ok()?;
+    let idx = v.to_ascii_lowercase().find("realm=")?;
+    let rest = v[idx + 6..].trim_start_matches('"');
+    let end = rest.find('"').unwrap_or(rest.len());
+    let realm = rest[..end].trim();
+    (!realm.is_empty()).then(|| realm.to_string())
 }
