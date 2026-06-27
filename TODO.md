@@ -22,7 +22,7 @@ ground truth from a real instance.
 
 - [x] **Validated the `.chlsj` schema against a real 27 MB export.** Confirmed top-level array; `mimeType`/`charset`/`contentEncoding` are on the **message** (not the body) — fixed; `response.status` is the int code; `body.encoded`+`encoding:"base64"` for binary; TLS is **`ssl.protocol`** (was reading a nonexistent `tlsVersion`) — fixed; `errorMessage` carries the real failure text — now used; `times`/`durations` confirmed (see below). Schema-mismatch guard stays quiet on real data.
 
-- [x] **Session-state enum confirmed: `EXCEPTION` is the failure state** (the 51 SSL-handshake failures). `is_failed_state` matches it; `error` is set from `errorMessage`. `tunnel` field present and parsed. (Note: the capture had SSL Proxying ON for its hosts, so no `tunnel:true` example — still want one capture with SSL Proxying OFF to exercise the tunnel-rendering path.)
+- [x] **Session-state enum confirmed: `EXCEPTION` is the failure state** (the 51 SSL-handshake failures — device didn't trust the Charles cert / pinning). `error` is set from `errorMessage` and rendered; the bogus default `status: 200` on a failed connection is now nulled. `tunnel` (SSL-Proxying-OFF passthrough) is a *different* case — handled + synthetic-tested; a real `tunnel:true` example would be nice-to-have but isn't required.
 
 - [x] **Timing fields confirmed**: `durations.total` (+ full `dns/connect/ssl/request/response/latency` breakdown) and `times.start` (ISO-8601). `duration_ms` and `slowest` populate correctly. (Optional future: surface the per-phase breakdown in `get_request`.)
 

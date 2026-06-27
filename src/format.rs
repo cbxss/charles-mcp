@@ -64,16 +64,15 @@ pub fn transaction_detail(t: &Transaction, req_body: &Body, resp_body: &Body) ->
     if let Some(p) = &t.protocol {
         out.push_str(&format!("protocol: {p}\n"));
     }
-    out.push_str(&format!(
-        "status: {}{}\n",
-        t.status
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "-".into()),
-        t.status_text
-            .as_deref()
-            .map(|s| format!(" {s}"))
-            .unwrap_or_default(),
-    ));
+    if let Some(s) = t.status {
+        out.push_str(&format!(
+            "status: {s}{}\n",
+            t.status_text
+                .as_deref()
+                .map(|x| format!(" {x}"))
+                .unwrap_or_default(),
+        ));
+    }
     if let Some(e) = &t.error {
         out.push_str(&format!("error: {e}\n"));
     }

@@ -254,6 +254,11 @@ impl ChlsTxn {
                 .map(str::to_string)
         });
 
+        // On a failed connection (e.g. SSL handshake refused) there is no real
+        // HTTP exchange — Charles defaults response.status to 200. Drop it so the
+        // error is the story, not a misleading "200".
+        let status = if error.is_some() { None } else { status };
+
         // For a WebSocket connection the request/response bodies are the raw
         // RFC 6455 frame streams (sent = masked, received = unmasked).
         let websocket = self.web_socket.then(|| {
