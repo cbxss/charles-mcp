@@ -60,6 +60,9 @@ pub enum CharlesError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    #[error("traffic store error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 impl From<CharlesError> for ErrorData {
@@ -75,7 +78,7 @@ impl From<CharlesError> for ErrorData {
             | InvalidArg(_)
             | UnknownFormat => ErrorData::invalid_request(e.to_string(), None),
             // Internal/unexpected failures.
-            ConvertFailed(_) | Parse(_) | Io(_) | Http(_) | Json(_) => {
+            ConvertFailed(_) | Parse(_) | Io(_) | Http(_) | Json(_) | Sqlite(_) => {
                 ErrorData::internal_error(e.to_string(), None)
             }
         }

@@ -1,6 +1,7 @@
 //! Compact, context-frugal rendering of session summaries and details.
 
 use crate::session::{Body, Transaction, TxnSummary};
+use crate::store::EntryRow;
 use crate::tools::inspect::{SearchHit, Stats};
 
 /// Render a list of summaries as an aligned, compact table.
@@ -52,6 +53,66 @@ pub fn summary_table(rows: &[TxnSummary]) -> String {
                 .unwrap_or_else(|| "-".into()),
             hw = host_w,
             pw = PATH_MAX,
+        ));
+    }
+    out
+}
+
+/// Render store entry rows as a table that also carries the resource-class tag
+/// (so API/JSON/error traffic is distinguishable from static-asset noise) — the
+/// rows arrive pre-sorted by priority.
+pub fn entry_table(rows: &[EntryRow]) -> String {
+    if rows.is_empty() {
+        return "requests: 0 total (no rows matched the filters)".to_string();
+    }
+    const PATH_MAX: usize = 40;
+    const HOST_MAX: usize = 26;
+    const CLASS_MAX: usize = 14;
+
+    let host_w = rows
+        .iter()
+        .map(|r| r.host.len().min(HOST_MAX))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:>4}  {:<6} {:>3}  {:<hw$}  {:<pw$}  {:<14} {:<cw$} {:>8}  {:>6}\n",
+        "#",
+        "METHOD",
+        "ST",
+        "HOST",
+        "PATH",
+        "MIME",
+        "CLASS",
+        "SIZE",
+        "MS",
+        hw = host_w,
+        pw = PATH_MAX,
+        cw = CLASS_MAX,
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:>4}  {:<6} {:>3}  {:<hw$}  {:<pw$}  {:<14} {:<cw$} {:>8}  {:>6}\n",
+            r.seq,
+            truncate(&r.method, 6),
+            r.status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+            truncate(&r.host, host_w),
+            truncate(&r.path, PATH_MAX),
+            truncate(r.mime.as_deref().unwrap_or("-"), 14),
+            truncate(&r.resource_class, CLASS_MAX),
+            r.response_size
+                .map(human_size)
+                .unwrap_or_else(|| "-".into()),
+            r.duration_ms
+                .map(|d| format!("{:.0}", d))
+                .unwrap_or_else(|| "-".into()),
+            hw = host_w,
+            pw = PATH_MAX,
+            cw = CLASS_MAX,
         ));
     }
     out

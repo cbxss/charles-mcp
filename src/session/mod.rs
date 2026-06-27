@@ -3,6 +3,7 @@
 
 pub mod body;
 pub mod chlsj;
+pub mod classify;
 pub mod convert;
 pub mod grpc;
 pub mod har;

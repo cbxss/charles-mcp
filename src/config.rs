@@ -78,6 +78,21 @@ pub struct Config {
     /// (optional; schemaless decoding works without it).
     #[arg(long, env = "CHARLES_PROTO_DIR")]
     pub proto_dir: Option<PathBuf>,
+
+    /// Path to the SQLite traffic store. When unset the store is ephemeral (a
+    /// temp file deleted on exit); set this to persist captures across restarts.
+    #[arg(long, env = "CHARLES_DB_PATH")]
+    pub db_path: Option<PathBuf>,
+
+    /// Max stored FILE captures kept in the store; the least-recently-used are
+    /// evicted past this (the live capture is always retained). Bounds disk use.
+    #[arg(long, env = "CHARLES_STORE_MAX_CAPTURES", default_value_t = 10)]
+    pub store_max_captures: usize,
+
+    /// Cap (bytes) on the decoded body text indexed per message for full-text
+    /// search — keeps the FTS index bounded on large bodies.
+    #[arg(long, env = "CHARLES_FTS_BODY_MAX_BYTES", default_value_t = 65_536)]
+    pub fts_body_max_bytes: usize,
 }
 
 impl Config {

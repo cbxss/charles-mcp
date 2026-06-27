@@ -1,10 +1,12 @@
 //! The MCP server: rmcp tool wiring over the Charles Web Interface client.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use tokio::sync::Mutex;
 
 use std::path::{Path, PathBuf};
 
@@ -13,13 +15,17 @@ use regex::Regex;
 use crate::config::Config;
 use crate::error::CharlesError;
 use crate::format;
-use crate::session::{Body, Session, WsDirection, WsOpcode, body, convert};
-use crate::tools::inspect::{self, ListFilters, Matcher};
+use crate::session::{Body, Session, SessionSource, WsDirection, WsOpcode, body, convert};
+use crate::store::{CaptureRef, StoreFilters, TrafficStore};
+use crate::tools::inspect::{self, Matcher, SearchHit};
 use crate::tools::{
-    ConfirmReq, ExportReq, GetRequestReq, ListRequestsReq, ReadFileReq, SearchReq, SetToolReq,
-    StatsReq, ThrottlingReq, ToolName, ToolNameReq, WsMessagesReq,
+    ConfirmReq, ExportReq, GetRequestReq, ListRequestsReq, ReadFileReq, ResetReq, SearchReq,
+    SetToolReq, StatsReq, ThrottlingReq, ToolName, ToolNameReq, WsMessagesReq,
 };
 use crate::web::WebClient;
+
+/// The live session's capture id in the store (a single rolling snapshot).
+const LIVE_CAPTURE: &str = "live";
 
 /// Validate a caller-supplied session path: it must be absolute (kills `-`
 /// argv-injection and relative surprises) and end in one of `allowed_exts`
@@ -48,6 +54,11 @@ fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, C
 #[derive(Clone)]
 pub struct CharlesServer {
     web: Arc<WebClient>,
+    /// The SQLite traffic store: ingest a session once, query it many times.
+    store: Arc<TrafficStore>,
+    /// The current live capture and when it was ingested, so a burst of inspect
+    /// calls reuses one snapshot (and request indices stay stable) within the TTL.
+    live: Arc<Mutex<Option<(Instant, CaptureRef)>>>,
     /// Loaded `.proto` descriptors (from --proto-dir) for named decoding.
     #[cfg(feature = "proto")]
     proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
@@ -69,12 +80,27 @@ impl CharlesServer {
     pub fn new(cfg: Arc<Config>) -> Result<Self, CharlesError> {
         #[cfg(feature = "proto")]
         let proto = Arc::new(load_proto_pool(&cfg));
+        let store = Arc::new(TrafficStore::open(cfg.db_path.as_deref())?);
         let web = Arc::new(WebClient::new(cfg)?);
         Ok(Self {
             web,
+            store,
+            live: Arc::new(Mutex::new(None)),
             #[cfg(feature = "proto")]
             proto,
         })
+    }
+
+    /// Run a blocking store operation off the async runtime.
+    async fn blocking<T, F>(&self, f: F) -> Result<T, CharlesError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&TrafficStore) -> Result<T, CharlesError> + Send + 'static,
+    {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|e| CharlesError::Parse(format!("store task failed: {e}")))?
     }
 
     fn decode_opts<'a>(
@@ -92,13 +118,89 @@ impl CharlesServer {
         CallToolResult::success(vec![Content::text(msg.into())])
     }
 
-    /// Resolve a session from a file path, or the live Charles session if none.
-    async fn resolve_session(&self, file_path: Option<&str>) -> Result<Session, CharlesError> {
+    /// Ensure the requested session (live, or a file) is ingested into the store,
+    /// returning its capture id for the query tools. Live snapshots are reused
+    /// within the cache TTL (indices stay stable in that window); file captures
+    /// are ingested once per (path, mtime, size) and LRU-capped.
+    async fn ensure_capture(&self, file_path: Option<&str>) -> Result<String, CharlesError> {
         match file_path {
-            Some(p) => convert::read_session_file(self.web.config(), Path::new(p)).await,
-            None => self.web.fetch_live_session().await,
+            None => self.ensure_live_capture().await,
+            Some(p) => self.ensure_file_capture(p).await,
         }
     }
+
+    async fn ensure_live_capture(&self) -> Result<String, CharlesError> {
+        let ttl = self.web.config().cache_ttl();
+        if !ttl.is_zero()
+            && let Some((at, _)) = self.live.lock().await.as_ref()
+            && at.elapsed() < ttl
+        {
+            self.blocking(|s| s.touch(LIVE_CAPTURE)).await.ok();
+            return Ok(LIVE_CAPTURE.to_string());
+        }
+        let session = self.web.fetch_live_session().await?;
+        let fts_cap = self.web.config().fts_body_max_bytes;
+        let cref = self
+            .blocking(move |s| {
+                s.ingest(LIVE_CAPTURE, "live", Some("live"), None, &session, fts_cap)
+            })
+            .await?;
+        *self.live.lock().await = Some((Instant::now(), cref));
+        Ok(LIVE_CAPTURE.to_string())
+    }
+
+    async fn ensure_file_capture(&self, path: &str) -> Result<String, CharlesError> {
+        let p = validate_session_path(path, &["chls", "chlz", "har", "chlsj"])?;
+        let source_key = file_source_key(&p).await;
+        if let Some(sk) = source_key.clone()
+            && let Some(found) = self.blocking(move |s| s.capture_by_source_key(&sk)).await?
+        {
+            let cid = found.capture_id.clone();
+            self.blocking(move |s| s.touch(&cid)).await.ok();
+            return Ok(found.capture_id);
+        }
+        let session = convert::read_session_file(self.web.config(), &p).await?;
+        let capture_id = format!("file:{}", p.display());
+        let source = p.display().to_string();
+        let fts_cap = self.web.config().fts_body_max_bytes;
+        let keep = self.web.config().store_max_captures;
+        let cid = capture_id.clone();
+        self.blocking(move |s| {
+            s.ingest(
+                &cid,
+                "file",
+                Some(&source),
+                source_key.as_deref(),
+                &session,
+                fts_cap,
+            )
+        })
+        .await?;
+        self.blocking(move |s| s.evict_file_captures(keep))
+            .await
+            .ok();
+        Ok(capture_id)
+    }
+}
+
+/// Build a file capture's identity key (`path:mtime:size`) so an unchanged file
+/// is ingested only once.
+async fn file_source_key(path: &Path) -> Option<String> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(format!("{}:{}:{}", path.display(), mtime, meta.len()))
+}
+
+/// Wrap a user query as an FTS5 phrase so punctuation / JSON-ish text is matched
+/// literally rather than being parsed as FTS query syntax (which would error on a
+/// stray quote or operator).
+fn fts_query(q: &str) -> String {
+    format!("\"{}\"", q.replace('"', "\"\""))
 }
 
 #[tool_router]
@@ -219,15 +321,19 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<ReadFileReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = validate_session_path(&req.path, &["chls", "chlz", "har", "chlsj"])?;
-        let session = convert::read_session_file(self.web.config(), &path).await?;
-        let summaries = session.summaries();
-        let table = format::summary_table(&summaries);
+        let capture = self.ensure_capture(Some(&req.path)).await?;
+        let filters = StoreFilters {
+            limit: 200,
+            ..Default::default()
+        };
+        let cid = capture.clone();
+        let (rows, total) = self.blocking(move |s| s.list(&cid, &filters)).await?;
         Ok(Self::ok(format!(
-            "{} request(s) in {}\n\n{}",
-            summaries.len(),
+            "{} request(s) in {} (showing {}, sorted by priority)\n\n{}",
+            total,
             req.path,
-            table
+            rows.len(),
+            format::entry_table(&rows),
         )))
     }
 
@@ -241,7 +347,7 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<ListRequestsReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = self.resolve_session(req.file_path.as_deref()).await?;
+        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
         let path_regex = match req.path_regex.as_deref() {
             Some(p) => Some(
                 Regex::new(p)
@@ -249,30 +355,30 @@ impl CharlesServer {
             ),
             None => None,
         };
-        let filters = ListFilters {
-            host: req.host.as_deref(),
-            method: req.method.as_deref(),
+        let filters = StoreFilters {
+            host: req.host.clone(),
+            method: req.method.clone(),
             status: req.status,
+            mime: req.mime.clone(),
+            resource_class: req.resource_class.clone(),
+            min_priority: req.min_priority,
             path_regex,
-            mime: req.mime.as_deref(),
             limit: req.limit.unwrap_or(50),
         };
-        let result = inspect::list(&session, &filters);
-        let truncated = result.total > result.rows.len();
+        let cid = capture.clone();
+        let (rows, total) = self.blocking(move |s| s.list(&cid, &filters)).await?;
+        let truncated = total > rows.len();
         let header = format!(
-            "requests: {} total, {} shown{}. Pass a row's # to get_request.\n",
-            result.total,
-            result.rows.len(),
+            "requests: {} total, {} shown{} (sorted by priority). Pass a row's # to get_request.\n",
+            total,
+            rows.len(),
             if truncated {
                 " (truncated; raise limit)"
             } else {
                 ""
             },
         );
-        Ok(Self::ok(format!(
-            "{header}{}",
-            format::summary_table(&result.rows)
-        )))
+        Ok(Self::ok(format!("{header}{}", format::entry_table(&rows))))
     }
 
     #[tool(
@@ -284,9 +390,23 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<GetRequestReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = self.resolve_session(req.file_path.as_deref()).await?;
-        let count = session.transactions.len();
-        let Some(t) = session.get(req.index) else {
+        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
+        let index = req.index;
+        let cid = capture.clone();
+        let txn = self.blocking(move |s| s.get(&cid, index)).await?;
+        let Some(t) = txn else {
+            let cid = capture.clone();
+            let (_, count) = self
+                .blocking(move |s| {
+                    s.list(
+                        &cid,
+                        &StoreFilters {
+                            limit: 0,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await?;
             // Return as a visible tool error (not a protocol error) so the agent
             // sees the valid range and can recover.
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -307,7 +427,7 @@ impl CharlesServer {
             .map(|r| body::decode_with(&r.raw, max, &opts))
             .unwrap_or(Body::NotCaptured);
         Ok(Self::ok(format::transaction_detail(
-            t, &req_body, &resp_body,
+            &t, &req_body, &resp_body,
         )))
     }
 
@@ -320,8 +440,11 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<WsMessagesReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = self.resolve_session(req.file_path.as_deref()).await?;
-        let Some(t) = session.get(req.index) else {
+        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
+        let index = req.index;
+        let cid = capture.clone();
+        let txn = self.blocking(move |s| s.get(&cid, index)).await?;
+        let Some(t) = txn else {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "request index {} is out of range.",
                 req.index
@@ -389,11 +512,38 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<SearchReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = self.resolve_session(req.file_path.as_deref()).await?;
-        let matcher = Matcher::build(&req.query, req.regex)?;
-        let fields = req.fields.unwrap_or_default();
+        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
         let limit = req.limit.unwrap_or(50);
-        let hits = inspect::search(&session, &matcher, &fields, limit);
+        let hits = if req.regex {
+            // Regex needs to scan decoded bodies: reconstruct the capture and
+            // reuse the in-memory matcher (the FTS index can't do regex).
+            let matcher = Matcher::build(&req.query, true)?;
+            let fields = req.fields.clone().unwrap_or_default();
+            let cid = capture.clone();
+            let txns = self.blocking(move |s| s.get_all(&cid)).await?;
+            let session = Session {
+                source: SessionSource::Live,
+                transactions: txns,
+            };
+            inspect::search(&session, &matcher, &fields, limit)
+        } else if req.query.trim().is_empty() {
+            Vec::new()
+        } else {
+            // Default: FTS5 full-text (fast, ranked) over url + headers + the
+            // decoded body (including protobuf field trees).
+            let q = fts_query(&req.query);
+            let cid = capture.clone();
+            let raw = self
+                .blocking(move |s| s.search_fts(&cid, &q, limit))
+                .await?;
+            raw.into_iter()
+                .map(|(seq, snippet)| SearchHit {
+                    index: seq,
+                    field: "fts",
+                    snippet,
+                })
+                .collect()
+        };
         let capped = if hits.len() >= limit {
             format!(" (capped at limit={limit}; narrow the query or raise limit)")
         } else {
@@ -415,8 +565,10 @@ impl CharlesServer {
         &self,
         Parameters(req): Parameters<StatsReq>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = self.resolve_session(req.file_path.as_deref()).await?;
-        Ok(Self::ok(format::stats_report(&inspect::stats(&session))))
+        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
+        let cid = capture.clone();
+        let stats = self.blocking(move |s| s.stats(&cid)).await?;
+        Ok(Self::ok(format::stats_report(&stats)))
     }
 
     #[tool(
@@ -451,7 +603,29 @@ impl CharlesServer {
             );
         }
         self.web.clear_session().await?;
+        // Drop the cached live snapshot so the next inspect call re-ingests the
+        // now-empty session instead of serving stale rows.
+        *self.live.lock().await = None;
         Ok(Self::ok("Session cleared."))
+    }
+
+    #[tool(
+        description = "Drop all captures from the traffic store, freeing its memory/disk. Requires \
+                       confirm=true. Affects only this server's cache/index — it does not touch \
+                       Charles or its live session."
+    )]
+    async fn reset_store(
+        &self,
+        Parameters(req): Parameters<ResetReq>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !req.confirm {
+            return Err(
+                CharlesError::InvalidArg("set confirm=true to reset the store".into()).into(),
+            );
+        }
+        self.blocking(|s| s.reset()).await?;
+        *self.live.lock().await = None;
+        Ok(Self::ok("Traffic store reset."))
     }
 
     #[tool(description = "Quit Charles. Destructive — requires confirm=true.")]

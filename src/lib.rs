@@ -9,5 +9,6 @@ pub mod error;
 pub mod format;
 pub mod server;
 pub mod session;
+pub mod store;
 pub mod tools;
 pub mod web;

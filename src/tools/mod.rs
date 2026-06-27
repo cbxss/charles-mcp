@@ -73,6 +73,12 @@ pub struct ConfirmReq {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResetReq {
+    /// Must be set to true to drop all stored captures from the traffic store.
+    pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileReq {
     /// Absolute path to a .chls, .har, or .chlsj session file.
     pub path: String,
@@ -95,6 +101,15 @@ pub struct ListRequestsReq {
     /// Only responses whose MIME type contains this substring.
     #[serde(default)]
     pub mime: Option<String>,
+    /// Only requests of this resource class: api_candidate, document, script,
+    /// static_asset, font, media, connect_tunnel, control, or unknown. Use
+    /// "api_candidate" to cut straight to the interesting API traffic.
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    /// Only requests whose priority score is at least this (api_candidates score
+    /// highest; static assets lowest). Filters out low-signal noise.
+    #[serde(default)]
+    pub min_priority: Option<i64>,
     /// Maximum number of rows to return (default 50).
     #[serde(default)]
     pub limit: Option<usize>,
