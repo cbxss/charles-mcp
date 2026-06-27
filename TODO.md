@@ -2,8 +2,10 @@
 
 These are the items from the adversarial power-user review that **cannot be
 verified or finished without a running Charles 5 install**. The no-live-Charles
-fixes are already done (see commit `3b30571`). Everything below is blocked on
-ground truth from a real instance.
+work is done: the schema/decoders grounded in real captures, the real
+`/session/export-json` read path, the SQLite traffic store (ingest-once +
+FTS5 + dedup), classification/priority, and `replay_request`. Everything below
+is blocked on ground truth from a real instance.
 
 ## How to unblock all of this (do once)
 
@@ -57,13 +59,13 @@ ground truth from a real instance.
 - [ ] **Auth realm / anonymous.** Verify basic-auth realm and that anonymous-allowed vs authenticated is reported correctly by `charles_status`.
   - Files: `WebClient::status`, `raw_request`/`send_control` in `src/web/{mod,live}.rs`.
 
-- [ ] **Performance on a real (hundreds-of-MB) session.** Measure export+convert cost and tune `--cache-ttl-ms` / `--timeout-ms`. Investigate whether the export endpoint supports a delta/`since` param to avoid pulling the whole session each refresh; consider streaming parse instead of whole-session-in-RAM.
+- [ ] **Performance on a real (hundreds-of-MB) session.** Partly addressed: the SQLite store ingests once and queries from SQL/FTS (no re-parse per call), and `--export-timeout-ms` separates the whole-session read from per-request timeouts. Still to do live: measure export+convert cost, tune `--cache-ttl-ms`, check for a delta/`since` export param, and consider a streaming parse instead of whole-session-in-RAM.
   - Files: `fetch_live_session` in `src/web/live.rs`, `resolve_session` in `src/server.rs`.
 
 ## P2 — capabilities a Charles power user expects (feature work, not bugs)
 
 - [ ] Respond to **breakpoints** (intercept → edit → Execute/Abort). Today enabling breakpoints can hang traffic with no way to release it. The Web Interface exposes no breakpoint-response endpoint, so this likely needs a different integration path.
-- [ ] **Compose / Repeat / Repeat Advanced** — replay or craft a request and resend (Charles's killer API workflow). At minimum, "get request as curl/raw".
+- [x] **Compose / Repeat / Repeat Advanced** — delivered by `replay_request` (re-issue a captured request with query/header/json/body overrides, mutating-gated). Pending live validation against a real origin. (Still open: "get request as curl/raw".)
 - [ ] **Rule management** for Map Local / Map Remote / Rewrite / Breakpoints (the master-switch toggles are no-ops without rules).
 - [ ] **Live tail / Focus / per-host watch** without re-exporting the whole session.
 
