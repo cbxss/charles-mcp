@@ -251,3 +251,75 @@ fn filters_and_stats() {
     assert_eq!(stats.total, 4);
     assert_eq!(stats.errors, 1, "only the 500 response is an error");
 }
+
+/// Two byte-identical bodies with DIFFERENT content-types must not collide on
+/// one row (else the second reconstructs with the first's metadata).
+#[test]
+fn identical_bytes_different_content_type_do_not_collide() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("store.db");
+    let bytes = b"ambiguous-payload";
+    let session = Session {
+        source: SessionSource::Live,
+        transactions: vec![
+            txn(
+                0,
+                "GET",
+                "a.example.com",
+                "/x",
+                200,
+                "application/json",
+                bytes,
+            ),
+            txn(1, "GET", "b.example.com", "/y", 200, "text/plain", bytes),
+        ],
+    };
+    {
+        let store = TrafficStore::open(Some(&db_path)).unwrap();
+        store
+            .ingest("live", "live", None, None, &session, 65536)
+            .unwrap();
+        // Each entry reconstructs with its OWN content-type.
+        let a = store.get("live", 0).unwrap().unwrap();
+        let b = store.get("live", 1).unwrap().unwrap();
+        assert_eq!(
+            a.response.unwrap().raw.content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            b.response.unwrap().raw.content_type.as_deref(),
+            Some("text/plain")
+        );
+    }
+    // Same bytes but distinct metadata → two rows (not one).
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM bodies", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "different content-types must not share one body row");
+}
+
+/// Eviction must never drop the capture just ingested (regression for
+/// `--store-max-captures 0` self-eviction).
+#[test]
+fn evict_retains_at_least_the_newest() {
+    let store = TrafficStore::open(None).unwrap();
+    let session = sample_session();
+    store
+        .ingest(
+            "file:one",
+            "file",
+            Some("/one.har"),
+            Some("/one.har:1:1"),
+            &session,
+            65536,
+        )
+        .unwrap();
+    // keep=0 would naively evict everything; it must floor to 1.
+    store.evict_file_captures(0).unwrap();
+    assert_eq!(
+        store.entry_count("file:one").unwrap(),
+        4,
+        "the just-ingested file capture must survive eviction"
+    );
+}

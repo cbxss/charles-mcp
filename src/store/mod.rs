@@ -99,7 +99,10 @@ impl TrafficStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("traffic store mutex poisoned")
+        // Recover from a poisoned lock rather than panicking forever: the store
+        // is a rebuildable cache, so a single panicking op must not brick every
+        // subsequent call for the process lifetime.
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Look up a capture by its `source_key` (`path:mtime:size` for files).
@@ -380,6 +383,10 @@ impl TrafficStore {
 
     /// Evict least-recently-used FILE captures beyond `keep` (live is untouched).
     pub fn evict_file_captures(&self, keep: usize) -> Result<(), CharlesError> {
+        // Always retain at least the most-recently-used file capture — otherwise
+        // `--store-max-captures 0` would evict the capture we just ingested
+        // (newest last_used) before the caller could query it.
+        let keep = keep.max(1);
         let conn = self.lock();
         // Capture ids to drop: file captures sorted oldest-first, skipping `keep`.
         let victims: Vec<String> = {
@@ -396,6 +403,17 @@ impl TrafficStore {
             sweep_orphan_bodies(&conn)?;
         }
         Ok(())
+    }
+
+    /// Number of entries in a capture (a cheap COUNT, no row materialization).
+    pub fn entry_count(&self, capture_id: &str) -> Result<usize, CharlesError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM entries WHERE capture_id = ?1",
+            params![capture_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Drop everything and reclaim space.
@@ -417,9 +435,25 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn sha_hex(bytes: &[u8]) -> String {
+/// Content-addressing key for a body: the sha256 of the bytes AND the
+/// content-dependent metadata stored alongside them (type/encoding/charset).
+/// Folding the metadata in means two byte-identical bodies that differ in, say,
+/// `application/json` vs `text/plain` get distinct rows — otherwise the first
+/// writer's metadata would win and later entries would decode with the wrong
+/// type. Truly-identical bodies (the repeated assets) still dedup to one row.
+fn body_key(raw: &RawBody) -> String {
     let mut h = Sha256::new();
-    h.update(bytes);
+    h.update(&raw.bytes);
+    for field in [
+        raw.content_type.as_deref(),
+        raw.content_encoding.as_deref(),
+        raw.grpc_encoding.as_deref(),
+        raw.declared_charset.as_deref(),
+    ] {
+        h.update([0u8]); // domain separator between bytes/fields
+        h.update(field.unwrap_or("").as_bytes());
+    }
+    h.update([raw.was_base64_wrapped as u8]);
     format!("{:x}", h.finalize())
 }
 
@@ -458,7 +492,7 @@ fn store_body(
     if !raw.captured || raw.bytes.is_empty() {
         return Ok(None);
     }
-    let sha = sha_hex(&raw.bytes);
+    let sha = body_key(raw);
     tx.execute(
         "INSERT OR IGNORE INTO bodies
            (sha256, byte_len, raw, content_type, content_encoding, grpc_encoding, declared_charset, was_base64)

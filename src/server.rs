@@ -131,10 +131,16 @@ impl CharlesServer {
 
     async fn ensure_live_capture(&self) -> Result<String, CharlesError> {
         let ttl = self.web.config().cache_ttl();
-        if !ttl.is_zero()
-            && let Some((at, _)) = self.live.lock().await.as_ref()
-            && at.elapsed() < ttl
-        {
+        // Compute freshness in a scope that drops the `live` guard before the
+        // await below (don't hold a lock across an await).
+        let fresh = !ttl.is_zero()
+            && self
+                .live
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|(at, _)| at.elapsed() < ttl);
+        if fresh {
             self.blocking(|s| s.touch(LIVE_CAPTURE)).await.ok();
             return Ok(LIVE_CAPTURE.to_string());
         }
@@ -396,17 +402,7 @@ impl CharlesServer {
         let txn = self.blocking(move |s| s.get(&cid, index)).await?;
         let Some(t) = txn else {
             let cid = capture.clone();
-            let (_, count) = self
-                .blocking(move |s| {
-                    s.list(
-                        &cid,
-                        &StoreFilters {
-                            limit: 0,
-                            ..Default::default()
-                        },
-                    )
-                })
-                .await?;
+            let count = self.blocking(move |s| s.entry_count(&cid)).await?;
             // Return as a visible tool error (not a protocol error) so the agent
             // sees the valid range and can recover.
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -526,7 +522,9 @@ impl CharlesServer {
                 transactions: txns,
             };
             inspect::search(&session, &matcher, &fields, limit)
-        } else if req.query.trim().is_empty() {
+        } else if !req.query.chars().any(|c| c.is_alphanumeric()) {
+            // Empty or punctuation-only: FTS would tokenize to an empty phrase
+            // (a syntax error on some SQLite builds) — return no hits cleanly.
             Vec::new()
         } else {
             // Default: FTS5 full-text (fast, ranked) over url + headers + the
