@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{env, path::Path};
 
 use clap::Parser;
 
@@ -64,6 +65,9 @@ pub struct Config {
 
     #[arg(long, env = "CHARLES_INCLUDE_CONTROL_TRAFFIC", default_value_t = false)]
     pub include_control_traffic: bool,
+
+    #[arg(long, env = "CHARLES_CONFIG_PATH")]
+    pub charles_config_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -99,6 +103,31 @@ impl Config {
     pub fn export_timeout(&self) -> Duration {
         Duration::from_millis(self.export_timeout_ms)
     }
+
+    pub fn resolved_charles_config_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.charles_config_path {
+            return Some(path.clone());
+        }
+        platform_default_config_path()
+    }
+}
+
+fn platform_default_config_path() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return home_path("Library/Preferences/com.xk72.charles.config");
+    }
+    if cfg!(target_os = "windows") {
+        return env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("Charles").join("charles.config"));
+    }
+    home_path(".charles.config")
+}
+
+fn home_path(suffix: &str) -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|p| p.join(Path::new(suffix)))
 }
 
 #[cfg(test)]

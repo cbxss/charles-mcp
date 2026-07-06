@@ -1,4 +1,5 @@
 pub mod inspect;
+pub mod rules;
 
 use std::collections::HashMap;
 

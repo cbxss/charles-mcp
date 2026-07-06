@@ -16,11 +16,13 @@ use crate::format;
 use crate::session::{Body, Session, SessionSource, WsDirection, WsOpcode, body, convert};
 use crate::store::{CaptureRef, StoreFilters, TrafficStore};
 use crate::tools::inspect::{self, Matcher, SearchHit};
+use crate::tools::rules::WriteRulesReq;
 use crate::tools::{
     ConfirmReq, ExportReq, GetRequestReq, ListRequestsReq, ReadFileReq, ReplayReq, ResetReq,
     SearchReq, SetToolReq, StatsReq, ThrottlingReq, ToolName, ToolNameReq, WsMessagesReq,
 };
 use crate::web::WebClient;
+use crate::web::control::CharlesTool;
 
 const LIVE_CAPTURE: &str = "live";
 
@@ -666,6 +668,117 @@ impl CharlesServer {
         )))
     }
 
+    #[tool(
+        description = "Write Charles-native interception rule XML for Map Local, Map Remote, and \
+                       Rewrite. This is the practical rule-management path because the Charles Web \
+                       Interface exposes tool toggles but not rule CRUD. Set enable_tools=true to \
+                       turn on the active Map Local / Map Remote / Rewrite engines. Set \
+                       save_to_charles_config=true plus confirm=true to back up and merge these \
+                       definitions into the persisted Charles config; restart/reload Charles for \
+                       newly saved definitions to load."
+    )]
+    async fn write_interception_rules(
+        &self,
+        Parameters(req): Parameters<WriteRulesReq>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = crate::tools::rules::validate_output_path(&req.path)?;
+        let xml = crate::tools::rules::build_rule_file(&req)?;
+        tokio::fs::write(&path, xml.as_bytes())
+            .await
+            .map_err(CharlesError::Io)?;
+        let mut actions = vec![format!(
+            "Wrote {} bytes of Charles rule XML to {}",
+            xml.len(),
+            req.path,
+        )];
+
+        if req.save_to_charles_config {
+            if !req.confirm {
+                return Err(CharlesError::InvalidArg(
+                    "set confirm=true to modify the Charles config file".into(),
+                )
+                .into());
+            }
+            let config_path = match req.config_path.as_deref() {
+                Some(path) => crate::tools::rules::validate_config_path(path)?,
+                None => self
+                    .web
+                    .config()
+                    .resolved_charles_config_path()
+                    .ok_or_else(|| {
+                        CharlesError::InvalidArg(
+                            "could not infer the Charles config path; pass config_path or set \
+                         CHARLES_CONFIG_PATH"
+                                .into(),
+                        )
+                    })?,
+            };
+            let existing = match tokio::fs::read_to_string(&config_path).await {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(CharlesError::Io(e).into()),
+            };
+            if tokio::fs::metadata(&config_path).await.is_ok() {
+                let backup = backup_path(&config_path);
+                tokio::fs::copy(&config_path, &backup)
+                    .await
+                    .map_err(CharlesError::Io)?;
+                actions.push(format!("Backed up Charles config to {}", backup.display()));
+            }
+            let merged = crate::tools::rules::merge_into_charles_config(&existing, &req);
+            if let Some(parent) = config_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(CharlesError::Io)?;
+            }
+            tokio::fs::write(&config_path, merged.as_bytes())
+                .await
+                .map_err(CharlesError::Io)?;
+            actions.push(format!(
+                "Saved rule definitions into Charles config {}. Restart/reload Charles for newly saved rules to be loaded.",
+                config_path.display()
+            ));
+        }
+
+        if req.enable_tools {
+            let enabled = self.enable_rule_tools(&req).await?;
+            if enabled.is_empty() {
+                actions.push("No rule tools needed enabling.".to_string());
+            } else {
+                actions.push(format!(
+                    "Enabled Charles tool engine(s): {}.",
+                    enabled.join(", ")
+                ));
+            }
+        }
+
+        Ok(Self::ok(format!(
+            "{}\n{}",
+            actions.join("\n"),
+            "Import the XML via Tools -> Import/Export Settings, or restart Charles with --config. Newly saved config rules require Charles to restart/reload before live traffic uses them.",
+        )))
+    }
+
+    async fn enable_rule_tools(
+        &self,
+        req: &WriteRulesReq,
+    ) -> Result<Vec<&'static str>, CharlesError> {
+        let mut enabled = Vec::new();
+        if !req.map_local.is_empty() {
+            self.web.set_tool(CharlesTool::MapLocal, true).await?;
+            enabled.push("map-local");
+        }
+        if !req.map_remote.is_empty() {
+            self.web.set_tool(CharlesTool::MapRemote, true).await?;
+            enabled.push("map-remote");
+        }
+        if !req.rewrite_sets.is_empty() {
+            self.web.set_tool(CharlesTool::Rewrite, true).await?;
+            enabled.push("rewrite");
+        }
+        Ok(enabled)
+    }
+
     #[tool(description = "Clear the current Charles session. Destructive — requires confirm=true.")]
     async fn clear_session(
         &self,
@@ -711,6 +824,15 @@ impl CharlesServer {
         self.web.quit_charles().await?;
         Ok(Self::ok("Quit signal sent to Charles."))
     }
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("charles.config");
+    path.with_file_name(format!("{file_name}.bak-{stamp}"))
 }
 
 #[tool_handler]
