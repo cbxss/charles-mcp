@@ -1,4 +1,6 @@
-use charles_mcp::session::{HttpMessage, RawBody, Session, SessionSource, Transaction};
+use charles_mcp::session::{
+    HttpMessage, RawBody, Session, SessionSource, Transaction, WsDirection, WsMessage, WsOpcode,
+};
 use charles_mcp::store::{StoreFilters, TrafficStore};
 
 fn txn(
@@ -268,6 +270,273 @@ fn identical_bytes_different_content_type_do_not_collide() {
         .query_row("SELECT count(*) FROM bodies", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 2, "different content-types must not share one body row");
+}
+
+fn txn_opt(
+    method: &str,
+    host: &str,
+    path: &str,
+    status: Option<u16>,
+    body: Option<&[u8]>,
+) -> Transaction {
+    Transaction {
+        scheme: "https".into(),
+        host: host.into(),
+        method: method.into(),
+        path: path.into(),
+        url: format!("https://{host}{path}"),
+        status,
+        response_size: body.map(|b| b.len() as u64),
+        request: HttpMessage {
+            headers: vec![],
+            raw: RawBody::default(),
+        },
+        response: body.map(|b| HttpMessage {
+            headers: vec![],
+            raw: RawBody {
+                bytes: b.to_vec(),
+                captured: true,
+                ..Default::default()
+            },
+        }),
+        ..Default::default()
+    }
+}
+
+fn live_session(txns: Vec<Transaction>) -> Session {
+    Session {
+        source: SessionSource::Live,
+        transactions: txns,
+    }
+}
+
+fn ingest_live(store: &TrafficStore, session: &Session) -> charles_mcp::store::CaptureRef {
+    store
+        .ingest_incremental("live", "live", Some("live"), None, session, 65536)
+        .unwrap()
+}
+
+#[test]
+fn incremental_appends_new_entries_with_stable_seqs() {
+    let store = TrafficStore::open(None).unwrap();
+    let s1 = live_session(vec![
+        txn_opt("GET", "a.com", "/1", Some(200), Some(b"one")),
+        txn_opt("GET", "b.com", "/2", Some(200), Some(b"two")),
+    ]);
+    assert_eq!(ingest_live(&store, &s1).entry_count, 2);
+
+    let s2 = live_session(vec![
+        txn_opt("GET", "a.com", "/1", Some(200), Some(b"one")),
+        txn_opt("GET", "b.com", "/2", Some(200), Some(b"two")),
+        txn_opt("GET", "c.com", "/3", Some(200), Some(b"three")),
+    ]);
+    let c2 = ingest_live(&store, &s2);
+    assert_eq!(c2.entry_count, 3);
+    assert_eq!(c2.generation, 1);
+
+    assert_eq!(store.get("live", 0).unwrap().unwrap().host, "a.com");
+    assert_eq!(store.get("live", 1).unwrap().unwrap().host, "b.com");
+    assert_eq!(
+        store.get("live", 2).unwrap().unwrap().host,
+        "c.com",
+        "the new arrival gets the next seq"
+    );
+}
+
+#[test]
+fn incremental_updates_completed_response_in_place() {
+    let store = TrafficStore::open(None).unwrap();
+    ingest_live(
+        &store,
+        &live_session(vec![txn_opt("POST", "api.com", "/login", None, None)]),
+    );
+    assert!(store.get("live", 0).unwrap().unwrap().response.is_none());
+
+    let c2 = ingest_live(
+        &store,
+        &live_session(vec![txn_opt(
+            "POST",
+            "api.com",
+            "/login",
+            Some(200),
+            Some(br#"{"ok":true}"#),
+        )]),
+    );
+    assert_eq!(c2.entry_count, 1, "same request completing must not duplicate");
+    let done = store.get("live", 0).unwrap().unwrap();
+    assert_eq!(done.status, Some(200));
+    assert_eq!(
+        done.response.unwrap().raw.bytes,
+        br#"{"ok":true}"#.to_vec()
+    );
+}
+
+#[test]
+fn incremental_skips_unchanged_entries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("s.db");
+    let store = TrafficStore::open(Some(&db)).unwrap();
+    let s = live_session(vec![
+        txn_opt("GET", "a.com", "/1", Some(200), Some(b"one")),
+        txn_opt("GET", "b.com", "/2", Some(200), Some(b"two")),
+    ]);
+    ingest_live(&store, &s);
+    let rowid_of_seq0 = || -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT rowid FROM entries WHERE capture_id='live' AND seq=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = rowid_of_seq0();
+    ingest_live(&store, &s);
+    assert_eq!(
+        before,
+        rowid_of_seq0(),
+        "an unchanged entry must not be re-inserted (rowid stays put)"
+    );
+}
+
+#[test]
+fn incremental_detects_session_reset() {
+    let store = TrafficStore::open(None).unwrap();
+    ingest_live(
+        &store,
+        &live_session(vec![
+            txn_opt("GET", "a.com", "/1", Some(200), Some(b"one")),
+            txn_opt("GET", "b.com", "/2", Some(200), Some(b"two")),
+        ]),
+    );
+
+    let c2 = ingest_live(
+        &store,
+        &live_session(vec![txn_opt("GET", "x.com", "/new", Some(200), Some(b"fresh"))]),
+    );
+    assert_eq!(c2.entry_count, 1, "clearing the session drops the old entries");
+    assert_eq!(store.get("live", 0).unwrap().unwrap().host, "x.com");
+    assert!(
+        store.get("live", 1).unwrap().is_none(),
+        "old seq 1 must be gone after a reset"
+    );
+}
+
+#[test]
+fn mutation_does_not_shift_later_seqs() {
+    let store = TrafficStore::open(None).unwrap();
+    ingest_live(
+        &store,
+        &live_session(vec![
+            txn_opt("GET", "a.com", "/a", Some(200), Some(b"a")),
+            txn_opt("POST", "b.com", "/b", None, None),
+        ]),
+    );
+
+    let c2 = ingest_live(
+        &store,
+        &live_session(vec![
+            txn_opt("GET", "a.com", "/a", Some(200), Some(b"a")),
+            txn_opt("POST", "b.com", "/b", Some(201), Some(b"done")),
+            txn_opt("GET", "c.com", "/c", Some(200), Some(b"c")),
+        ]),
+    );
+    assert_eq!(c2.entry_count, 3);
+    let b = store.get("live", 1).unwrap().unwrap();
+    assert_eq!(b.host, "b.com");
+    assert_eq!(b.status, Some(201), "b completed in place, still at seq 1");
+    assert_eq!(
+        store.get("live", 2).unwrap().unwrap().host,
+        "c.com",
+        "the new arrival lands above all existing seqs"
+    );
+}
+
+fn ws_frame(direction: WsDirection, opcode: WsOpcode, bytes: Vec<u8>) -> WsMessage {
+    WsMessage {
+        direction,
+        opcode,
+        payload: RawBody {
+            bytes,
+            captured: true,
+            ..Default::default()
+        },
+    }
+}
+
+fn ws_txn() -> Transaction {
+    let mut proto = vec![0x0a, 0x07];
+    proto.extend_from_slice(b"wsproto");
+    Transaction {
+        scheme: "wss".into(),
+        host: "socket.example.com".into(),
+        method: "GET".into(),
+        path: "/live".into(),
+        url: "wss://socket.example.com/live".into(),
+        status: Some(101),
+        request: HttpMessage {
+            headers: vec![],
+            raw: RawBody::default(),
+        },
+        websocket: Some(vec![
+            ws_frame(
+                WsDirection::Received,
+                WsOpcode::Text,
+                b"hello socketsecret world".to_vec(),
+            ),
+            ws_frame(WsDirection::Sent, WsOpcode::Binary, proto),
+        ]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn fts_finds_websocket_frame_content() {
+    let store = TrafficStore::open(None).unwrap();
+    ingest_live(&store, &live_session(vec![ws_txn()]));
+
+    let text_hits = store.search_fts("live", "socketsecret", 10).unwrap();
+    assert!(
+        text_hits.iter().any(|(seq, _)| *seq == 0),
+        "a text frame's payload must be full-text searchable"
+    );
+
+    let proto_hits = store.search_fts("live", "wsproto", 10).unwrap();
+    assert!(
+        proto_hits.iter().any(|(seq, _)| *seq == 0),
+        "a binary protobuf frame's decoded content must be searchable"
+    );
+}
+
+#[test]
+fn fts_matches_url_and_header_columns() {
+    let store = TrafficStore::open(None).unwrap();
+    ingest_live(&store, &sample_session());
+    assert!(
+        store
+            .search_fts("live", "orders", 10)
+            .unwrap()
+            .iter()
+            .any(|(seq, _)| *seq == 3),
+        "a token from the URL (/api/orders) must be FTS-searchable"
+    );
+    assert!(
+        !store.search_fts("live", "Accept", 10).unwrap().is_empty(),
+        "a request header token must be FTS-searchable"
+    );
+}
+
+#[test]
+fn regex_search_covers_websocket_frames() {
+    use charles_mcp::tools::inspect::{Matcher, search};
+    let session = live_session(vec![ws_txn()]);
+    let m = Matcher::build("socketsecret", false).unwrap();
+    let hits = search(&session, &m, &[], 10);
+    assert!(
+        hits.iter().any(|h| h.field == "ws"),
+        "the regex/substring path must reach ws frames, tagged 'ws'"
+    );
 }
 
 #[test]

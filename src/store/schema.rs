@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE captures (
@@ -29,7 +29,9 @@ CREATE TABLE bodies (
 CREATE TABLE entries (
   entry_id          TEXT PRIMARY KEY,
   capture_id        TEXT NOT NULL REFERENCES captures(capture_id) ON DELETE CASCADE,
-  seq               INTEGER NOT NULL,          -- 0-based position in the capture (the public index)
+  seq               INTEGER NOT NULL,          -- stable monotonic id within the capture (the public index)
+  entry_key         TEXT,                      -- synthesized stable identity (survives re-ingest)
+  content_hash      TEXT,                      -- cheap mutation probe (status/size/duration/ws-count)
   method            TEXT NOT NULL DEFAULT '',
   scheme            TEXT NOT NULL DEFAULT '',
   host              TEXT NOT NULL DEFAULT '',
@@ -63,6 +65,7 @@ CREATE TABLE entries (
   UNIQUE (capture_id, seq)
 );
 CREATE INDEX entries_browse ON entries(capture_id, priority DESC, seq);
+CREATE INDEX entries_key    ON entries(capture_id, entry_key);
 CREATE INDEX entries_host   ON entries(capture_id, host);
 CREATE INDEX entries_status ON entries(capture_id, response_status);
 CREATE INDEX entries_errors ON entries(capture_id, seq) WHERE is_error = 1;

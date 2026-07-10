@@ -51,9 +51,6 @@ pub struct Config {
     #[arg(long, env = "CHARLES_EXPORT_FORMAT", default_value = "chlsj")]
     pub default_export_format: String,
 
-    #[arg(long, env = "CHARLES_PROTO_DIR")]
-    pub proto_dir: Option<PathBuf>,
-
     #[arg(long, env = "CHARLES_DB_PATH")]
     pub db_path: Option<PathBuf>,
 

@@ -144,6 +144,16 @@ pub fn search(
             });
             continue;
         }
+        if want(SearchField::Body)
+            && let Some(s) = search_ws(matcher, t)
+        {
+            hits.push(SearchHit {
+                index: t.index,
+                field: "ws",
+                snippet: s,
+            });
+            continue;
+        }
     }
     hits
 }
@@ -177,6 +187,21 @@ fn search_body(matcher: &Matcher, t: &Transaction) -> Option<String> {
         if let Some(hay) = hay
             && let Some(pos) = matcher.find(&hay)
         {
+            return Some(snippet(&hay, pos));
+        }
+    }
+    None
+}
+
+fn search_ws(matcher: &Matcher, t: &Transaction) -> Option<String> {
+    const SEARCH_CAP: usize = 1 << 20;
+    let frames = t.websocket.as_ref()?;
+    for m in frames {
+        let hay = body::ws_frame_text(&m.payload, SEARCH_CAP);
+        if hay.is_empty() {
+            continue;
+        }
+        if let Some(pos) = matcher.find(&hay) {
             return Some(snippet(&hay, pos));
         }
     }

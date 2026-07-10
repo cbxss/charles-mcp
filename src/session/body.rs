@@ -13,6 +13,13 @@ pub fn decode(raw: &RawBody, max_bytes: usize) -> Body {
     decode_with(raw, max_bytes, &DecodeOptions::default())
 }
 
+pub fn ws_frame_text(payload: &RawBody, max_bytes: usize) -> String {
+    match decode(payload, max_bytes) {
+        Body::Text { text, .. } => text,
+        _ => protobuf::try_decode_to_tree(&payload.bytes).unwrap_or_default(),
+    }
+}
+
 pub fn decode_with(raw: &RawBody, max_bytes: usize, opts: &DecodeOptions) -> Body {
     if !raw.captured {
         return Body::NotCaptured;

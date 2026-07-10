@@ -46,11 +46,69 @@ fn validate_session_path(path: &str, allowed_exts: &[&str]) -> Result<PathBuf, C
     Ok(p.to_path_buf())
 }
 
+#[cfg(feature = "proto")]
+fn is_protobufish(ct: Option<&str>) -> bool {
+    ct.map(|c| {
+        let l = c.to_ascii_lowercase();
+        crate::session::grpc::is_grpc_ct(&l) || crate::session::grpc::is_protobuf_ct(&l)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(feature = "proto")]
+fn proto_note(
+    pool: Option<&crate::session::protobuf::ProtoPool>,
+    proto_type: Option<&str>,
+    t: &crate::session::Transaction,
+    req_body: &Body,
+    resp_body: &Body,
+) -> Option<String> {
+    let pool = pool?;
+    let resolved = match pool.resolve_name(proto_type) {
+        Ok(name) => name,
+        Err(e) => return Some(format!("⚠ proto: {e}")),
+    };
+    let named = matches!(req_body, Body::Protobuf { named: true, .. })
+        || matches!(resp_body, Body::Protobuf { named: true, .. });
+    if named {
+        return None;
+    }
+    let req_ct = t.request.raw.content_type.as_deref();
+    let resp_ct = t
+        .response
+        .as_ref()
+        .and_then(|r| r.raw.content_type.as_deref());
+    if !is_protobufish(req_ct) && !is_protobufish(resp_ct) {
+        Some(format!(
+            "⚠ proto: '{resolved}' not applied — no protobuf/gRPC content-type (request: {}, response: {}).",
+            req_ct.unwrap_or("(none)"),
+            resp_ct.unwrap_or("(none)"),
+        ))
+    } else {
+        Some(format!(
+            "⚠ proto: '{resolved}' did not match the wire bytes (wrong message type?); showing schemaless decode."
+        ))
+    }
+}
+
+fn tail_since(only_new: bool, watermark: &mut usize, count: usize) -> Option<i64> {
+    if !only_new {
+        return None;
+    }
+    let since = (*watermark).min(count);
+    *watermark = count;
+    Some(since as i64)
+}
+
 #[derive(Default)]
 struct LiveState {
     snapshot: Option<(Instant, CaptureRef)>,
     watermark: usize,
 }
+
+#[cfg(feature = "proto")]
+type ProtoCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::session::protobuf::ProtoPool>>>>;
 
 #[derive(Clone)]
 pub struct CharlesServer {
@@ -58,25 +116,11 @@ pub struct CharlesServer {
     store: Arc<TrafficStore>,
     live: Arc<Mutex<LiveState>>,
     #[cfg(feature = "proto")]
-    proto: Arc<Option<crate::session::protobuf::ProtoPool>>,
-}
-
-#[cfg(feature = "proto")]
-fn load_proto_pool(cfg: &Config) -> Option<crate::session::protobuf::ProtoPool> {
-    let dir = cfg.proto_dir.as_ref()?;
-    match crate::session::protobuf::ProtoPool::load_dir(dir) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!("failed to load --proto-dir {}: {e}", dir.display());
-            None
-        }
-    }
+    proto_cache: ProtoCache,
 }
 
 impl CharlesServer {
     pub fn new(cfg: Arc<Config>) -> Result<Self, CharlesError> {
-        #[cfg(feature = "proto")]
-        let proto = Arc::new(load_proto_pool(&cfg));
         let store = Arc::new(TrafficStore::open(cfg.db_path.as_deref())?);
         let web = Arc::new(WebClient::new(cfg)?);
         Ok(Self {
@@ -84,7 +128,7 @@ impl CharlesServer {
             store,
             live: Arc::new(Mutex::new(LiveState::default())),
             #[cfg(feature = "proto")]
-            proto,
+            proto_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -99,15 +143,71 @@ impl CharlesServer {
             .map_err(|e| CharlesError::Parse(format!("store task failed: {e}")))?
     }
 
+    #[cfg(feature = "proto")]
+    fn proto_pool(
+        &self,
+        file: Option<&str>,
+        root: Option<&str>,
+    ) -> Result<Option<Arc<crate::session::protobuf::ProtoPool>>, CharlesError> {
+        let Some(file) = file else { return Ok(None) };
+        let path = validate_session_path(file, &["proto"])?;
+        let root_path = match root {
+            Some(r) => {
+                let rp = PathBuf::from(r);
+                if !rp.is_absolute() {
+                    return Err(CharlesError::InvalidArg(format!(
+                        "proto_root must be absolute, got '{r}'"
+                    )));
+                }
+                Some(rp)
+            }
+            None => None,
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let key = format!(
+            "{}|{}|{mtime}",
+            path.display(),
+            root_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+        if let Some(p) = self
+            .proto_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Some(p.clone()));
+        }
+        let pool = Arc::new(crate::session::protobuf::ProtoPool::load_file(
+            &path,
+            root_path.as_deref(),
+        )?);
+        self.proto_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, pool.clone());
+        Ok(Some(pool))
+    }
+
+    #[cfg(feature = "proto")]
     fn decode_opts<'a>(
-        &'a self,
+        &self,
+        pool: Option<&'a crate::session::protobuf::ProtoPool>,
         proto_type: Option<&'a str>,
     ) -> crate::session::body::DecodeOptions<'a> {
-        crate::session::body::DecodeOptions {
-            #[cfg(feature = "proto")]
-            pool: self.proto.as_ref().as_ref(),
-            proto_type,
-        }
+        crate::session::body::DecodeOptions { pool, proto_type }
+    }
+
+    #[cfg(not(feature = "proto"))]
+    fn decode_opts<'a>(
+        &self,
+        proto_type: Option<&'a str>,
+    ) -> crate::session::body::DecodeOptions<'a> {
+        crate::session::body::DecodeOptions { proto_type }
     }
 
     fn ok(msg: impl Into<String>) -> CallToolResult {
@@ -115,15 +215,24 @@ impl CharlesServer {
     }
 
     async fn ensure_capture(&self, file_path: Option<&str>) -> Result<String, CharlesError> {
+        self.ensure_capture_fresh(file_path, false).await
+    }
+
+    async fn ensure_capture_fresh(
+        &self,
+        file_path: Option<&str>,
+        force: bool,
+    ) -> Result<String, CharlesError> {
         match file_path {
-            None => self.ensure_live_capture().await,
+            None => self.ensure_live_capture(force).await,
             Some(p) => self.ensure_file_capture(p).await,
         }
     }
 
-    async fn ensure_live_capture(&self) -> Result<String, CharlesError> {
+    async fn ensure_live_capture(&self, force: bool) -> Result<String, CharlesError> {
         let ttl = self.web.config().cache_ttl();
-        let fresh = !ttl.is_zero()
+        let fresh = !force
+            && !ttl.is_zero()
             && self
                 .live
                 .lock()
@@ -139,7 +248,7 @@ impl CharlesServer {
         let fts_cap = self.web.config().fts_body_max_bytes;
         let cref = self
             .blocking(move |s| {
-                s.ingest(LIVE_CAPTURE, "live", Some("live"), None, &session, fts_cap)
+                s.ingest_incremental(LIVE_CAPTURE, "live", Some("live"), None, &session, fts_cap)
             })
             .await?;
         self.live.lock().await.snapshot = Some((Instant::now(), cref));
@@ -361,8 +470,9 @@ impl CharlesServer {
         description = "Browse/filter captured requests (host, method, status, path_regex, mime, \
                        resource_class, min_priority) -> a compact table sorted by priority, each \
                        row tagged with its resource class. only_new=true returns just the requests \
-                       that arrived since your last list_requests call (live tail; pair with host \
-                       for a per-host watch). Use search_traffic for full-text/body search; \
+                       that arrived since your last only_new call and re-fetches the live session \
+                       first (live tail; a plain list in between does not advance the tail; pair \
+                       with host for a per-host watch). Use search_traffic for full-text/body search; \
                        get_request for one request's full detail. Live session unless file_path \
                        (.har/.chlsj/.chls) is given."
     )]
@@ -371,7 +481,9 @@ impl CharlesServer {
         Parameters(req): Parameters<ListRequestsReq>,
     ) -> Result<CallToolResult, ErrorData> {
         let is_live = req.file_path.is_none();
-        let capture = self.ensure_capture(req.file_path.as_deref()).await?;
+        let capture = self
+            .ensure_capture_fresh(req.file_path.as_deref(), is_live && req.only_new)
+            .await?;
         let path_regex = match req.path_regex.as_deref() {
             Some(p) => Some(
                 Regex::new(p)
@@ -386,9 +498,7 @@ impl CharlesServer {
                 .as_ref()
                 .map(|(_, c)| c.entry_count)
                 .unwrap_or(0);
-            let since = req.only_new.then(|| live.watermark.min(count) as i64);
-            live.watermark = count;
-            since
+            tail_since(req.only_new, &mut live.watermark, count)
         } else {
             None
         };
@@ -422,7 +532,10 @@ impl CharlesServer {
     #[tool(
         description = "Fetch ONE request by index (from list_requests/search_traffic): full \
                        headers, decoded/pretty bodies, and timing. Use max_body_bytes to cap \
-                       large bodies."
+                       large bodies. For named protobuf/gRPC decoding pass proto_file (absolute \
+                       path to a .proto) plus proto_type (short or fully-qualified message name; \
+                       optional if the file defines one message); proto_root sets the import root \
+                       for protos that import others (defaults to the file's directory)."
     )]
     async fn get_request(
         &self,
@@ -445,22 +558,42 @@ impl CharlesServer {
         let max = req
             .max_body_bytes
             .unwrap_or(self.web.config().body_max_bytes);
+
+        #[cfg(feature = "proto")]
+        let pool = self.proto_pool(req.proto_file.as_deref(), req.proto_root.as_deref())?;
+        #[cfg(feature = "proto")]
+        let opts = self.decode_opts(pool.as_deref(), req.proto_type.as_deref());
+        #[cfg(not(feature = "proto"))]
         let opts = self.decode_opts(req.proto_type.as_deref());
+
         let req_body = body::decode_with(&t.request.raw, max, &opts);
         let resp_body = t
             .response
             .as_ref()
             .map(|r| body::decode_with(&r.raw, max, &opts))
             .unwrap_or(Body::NotCaptured);
-        Ok(Self::ok(format::transaction_detail(
-            &t, &req_body, &resp_body,
-        )))
+
+        let detail = format::transaction_detail(&t, &req_body, &resp_body);
+        #[cfg(feature = "proto")]
+        let detail = match proto_note(
+            pool.as_deref(),
+            req.proto_type.as_deref(),
+            &t,
+            &req_body,
+            &resp_body,
+        ) {
+            Some(note) => format!("{note}\n\n{detail}"),
+            None => detail,
+        };
+        Ok(Self::ok(detail))
     }
 
     #[tool(
         description = "List the decoded WebSocket frames of a wss/ws transaction (by index): \
                        direction (→ sent / ← received), opcode, and decoded payload (text/JSON, \
-                       or protobuf for binary frames). Filter by direction; cap with limit."
+                       or protobuf for binary frames). Filter by direction; cap with limit. Pass \
+                       proto_file/proto_type (+ optional proto_root) to name-decode binary \
+                       protobuf frames, same as get_request."
     )]
     async fn get_websocket_messages(
         &self,
@@ -487,6 +620,12 @@ impl CharlesServer {
             .unwrap_or(self.web.config().body_max_bytes);
         let limit = req.limit.unwrap_or(100);
         let want = req.direction.as_deref().map(|d| d.to_ascii_lowercase());
+
+        #[cfg(feature = "proto")]
+        let pool = self.proto_pool(req.proto_file.as_deref(), req.proto_root.as_deref())?;
+        #[cfg(feature = "proto")]
+        let opts = self.decode_opts(pool.as_deref(), req.proto_type.as_deref());
+        #[cfg(not(feature = "proto"))]
         let opts = self.decode_opts(None);
 
         let mut out = format!("{} WebSocket frame(s) in #{}\n\n", frames.len(), req.index);
@@ -510,10 +649,14 @@ impl CharlesServer {
             let arrow = if dir == "sent" { "→" } else { "←" };
             out.push_str(&format!("[{i}] {arrow} {:?}\n", m.opcode));
             if matches!(m.opcode, WsOpcode::Binary)
-                && let Some((tree, _)) =
+                && let Some((tree, named)) =
                     crate::session::protobuf::try_decode(&m.payload.bytes, &opts)
             {
-                out.push_str("(protobuf, schemaless)\n");
+                out.push_str(if named {
+                    "(protobuf)\n"
+                } else {
+                    "(protobuf, schemaless)\n"
+                });
                 out.push_str(&tree);
                 if !tree.ends_with('\n') {
                     out.push('\n');
@@ -528,9 +671,10 @@ impl CharlesServer {
     }
 
     #[tool(
-        description = "Full-text/regex search across request URLs, headers, and bodies -> matching \
-                       indices with snippets. Substring (case-insensitive) unless regex=true. Use \
-                       list_requests to filter by structured fields; get_request to read a match."
+        description = "Full-text/regex search across request URLs, headers, bodies, and decoded \
+                       WebSocket frames -> matching indices with snippets. Substring \
+                       (case-insensitive) unless regex=true. Use list_requests to filter by \
+                       structured fields; get_request to read a match."
     )]
     async fn search_traffic(
         &self,
@@ -852,7 +996,57 @@ impl ServerHandler for CharlesServer {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_session_path;
+    use super::{fts_query, tail_since, validate_session_path};
+
+    #[test]
+    fn fts_query_wraps_as_phrase_and_escapes_quotes() {
+        assert_eq!(fts_query("token"), "\"token\"");
+        let out = fts_query("a\"b");
+        assert!(
+            out.starts_with('"') && out.ends_with('"'),
+            "query must be a quoted phrase: {out}"
+        );
+        assert!(
+            out.contains("\"\""),
+            "an embedded quote must be doubled so FTS5 syntax stays valid: {out}"
+        );
+    }
+
+    #[test]
+    fn tail_since_only_advances_on_tail_calls() {
+        let mut wm = 0usize;
+        assert_eq!(tail_since(false, &mut wm, 5), None);
+        assert_eq!(wm, 0, "a plain browse must not advance the tail");
+
+        assert_eq!(tail_since(true, &mut wm, 5), Some(0));
+        assert_eq!(wm, 5);
+
+        assert_eq!(tail_since(true, &mut wm, 5), Some(5));
+        assert_eq!(wm, 5, "no new traffic -> nothing new");
+
+        assert_eq!(tail_since(true, &mut wm, 8), Some(5));
+        assert_eq!(wm, 8, "three new arrivals surfaced");
+    }
+
+    #[test]
+    fn tail_since_browse_between_tails_keeps_the_tail() {
+        let mut wm = 0usize;
+        assert_eq!(tail_since(true, &mut wm, 3), Some(0));
+        assert_eq!(wm, 3);
+
+        assert_eq!(tail_since(false, &mut wm, 100), None);
+        assert_eq!(wm, 3, "filtered/full browse must not clobber the watermark");
+
+        assert_eq!(tail_since(true, &mut wm, 100), Some(3));
+        assert_eq!(wm, 100, "tail still sees everything since the last tail");
+    }
+
+    #[test]
+    fn tail_since_clamps_when_count_shrinks() {
+        let mut wm = 10usize;
+        assert_eq!(tail_since(true, &mut wm, 4), Some(4));
+        assert_eq!(wm, 4, "watermark clamps down to a shrunken capture");
+    }
 
     #[test]
     fn path_must_be_absolute_with_allowed_ext() {
@@ -861,5 +1055,120 @@ mod tests {
         assert!(validate_session_path("/home/u/.zshrc", &["har", "chlsj"]).is_err());
         assert!(validate_session_path("/tmp/s.har", &["har", "chlsj", "chls"]).is_ok());
         assert!(validate_session_path("/tmp/s.chlsj", &["chlsj"]).is_ok());
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn protobufish_matches_grpc_and_protobuf_cts() {
+        use super::is_protobufish;
+        assert!(is_protobufish(Some("application/grpc")));
+        assert!(is_protobufish(Some("application/x-protobuf")));
+        assert!(is_protobufish(Some("application/grpc-web-text+proto")));
+        assert!(!is_protobufish(Some("application/json")));
+        assert!(!is_protobufish(None));
+    }
+
+    #[cfg(feature = "proto")]
+    mod proto_note_tests {
+        use super::super::proto_note;
+        use crate::session::protobuf::ProtoPool;
+        use crate::session::{Body, HttpMessage, RawBody, Transaction};
+
+        fn pool(body: &str) -> (tempfile::TempDir, ProtoPool) {
+            use std::io::Write as _;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("demo.proto");
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(f, "{body}").unwrap();
+            f.flush().unwrap();
+            let pool = ProtoPool::load_file(&path, None).unwrap();
+            (dir, pool)
+        }
+
+        fn msg(ct: Option<&str>) -> HttpMessage {
+            HttpMessage {
+                raw: RawBody {
+                    content_type: ct.map(String::from),
+                    captured: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn txn(req_ct: Option<&str>, resp_ct: Option<&str>) -> Transaction {
+            Transaction {
+                request: msg(req_ct),
+                response: resp_ct.map(|c| msg(Some(c))),
+                ..Default::default()
+            }
+        }
+
+        fn pb(named: bool) -> Body {
+            Body::Protobuf {
+                tree: String::new(),
+                message_count: 1,
+                named,
+                truncated: false,
+                original_len: 0,
+            }
+        }
+
+        const ONE: &str = "syntax = \"proto3\";\npackage demo;\nmessage Ping { string msg = 1; }\n";
+        const TWO: &str = "syntax = \"proto3\";\npackage demo;\nmessage Ping { string msg = 1; }\nmessage Pong { int32 n = 1; }\n";
+
+        #[test]
+        fn no_pool_means_no_note() {
+            let t = txn(Some("application/x-protobuf"), None);
+            assert!(proto_note(None, Some("Ping"), &t, &pb(false), &Body::NotCaptured).is_none());
+        }
+
+        #[test]
+        fn named_success_produces_no_note() {
+            let (_d, p) = pool(ONE);
+            let t = txn(Some("application/x-protobuf"), None);
+            let note = proto_note(Some(&p), Some("Ping"), &t, &pb(true), &Body::NotCaptured);
+            assert!(note.is_none(), "got: {note:?}");
+        }
+
+        #[test]
+        fn unknown_type_note_lists_candidates() {
+            let (_d, p) = pool(TWO);
+            let t = txn(Some("application/x-protobuf"), None);
+            let note = proto_note(Some(&p), Some("Nope"), &t, &pb(false), &Body::NotCaptured).unwrap();
+            assert!(note.contains("unknown proto_type 'Nope'"), "{note}");
+            assert!(note.contains("demo.Ping") && note.contains("demo.Pong"), "{note}");
+        }
+
+        #[test]
+        fn missing_type_with_many_messages_notes_candidates() {
+            let (_d, p) = pool(TWO);
+            let t = txn(Some("application/x-protobuf"), None);
+            let note = proto_note(Some(&p), None, &t, &pb(false), &Body::NotCaptured).unwrap();
+            assert!(note.contains("no proto_type given"), "{note}");
+        }
+
+        #[test]
+        fn non_protobuf_content_type_is_called_out() {
+            let (_d, p) = pool(ONE);
+            let t = txn(Some("application/json"), Some("text/html"));
+            let text = Body::Text {
+                text: String::new(),
+                charset: "utf-8".into(),
+                truncated: false,
+                original_len: 0,
+            };
+            let note = proto_note(Some(&p), Some("Ping"), &t, &text, &Body::NotCaptured).unwrap();
+            assert!(note.contains("no protobuf/gRPC content-type"), "{note}");
+            assert!(note.contains("application/json"), "{note}");
+        }
+
+        #[test]
+        fn wire_mismatch_is_called_out() {
+            let (_d, p) = pool(ONE);
+            let t = txn(Some("application/x-protobuf"), None);
+            let note = proto_note(Some(&p), Some("Ping"), &t, &pb(false), &Body::NotCaptured).unwrap();
+            assert!(note.contains("did not match the wire bytes"), "{note}");
+        }
     }
 }

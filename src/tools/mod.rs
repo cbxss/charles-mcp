@@ -109,6 +109,10 @@ pub struct GetRequestReq {
     #[serde(default)]
     pub proto_type: Option<String>,
     #[serde(default)]
+    pub proto_file: Option<String>,
+    #[serde(default)]
+    pub proto_root: Option<String>,
+    #[serde(default)]
     pub file_path: Option<String>,
 }
 
@@ -121,6 +125,12 @@ pub struct WsMessagesReq {
     pub direction: Option<String>,
     #[serde(default)]
     pub max_body_bytes: Option<usize>,
+    #[serde(default)]
+    pub proto_type: Option<String>,
+    #[serde(default)]
+    pub proto_file: Option<String>,
+    #[serde(default)]
+    pub proto_root: Option<String>,
     #[serde(default)]
     pub file_path: Option<String>,
 }

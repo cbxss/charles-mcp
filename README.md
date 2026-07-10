@@ -50,8 +50,9 @@ Every flag has a `CHARLES_*` env fallback; run `--help` for the full list. Commo
 | `--proxy-host` / `--proxy-port` | `127.0.0.1` / `8888` | Charles proxy |
 | `--web-user` / `--web-pass` | _(none)_ | Web Interface basic auth |
 | `--db-path` | _(none)_ | persist the store (default: in-memory) |
-| `--proto-dir` | _(none)_ | `.proto` files for named protobuf/gRPC decoding |
 | `--charles-config-path` | platform default | config file used by `write_interception_rules(save_to_charles_config)` |
+
+For named protobuf/gRPC decoding, pass a `.proto` file per call: `get_request(index, proto_file="/abs/path/api.proto", proto_type="pkg.Msg")`. `proto_type` may be a short or fully-qualified name and can be omitted when the file defines a single message; `proto_root` sets the import root for `.proto` files that `import` others (defaults to the file's directory). The same args work on `get_websocket_messages` for binary frames.
 
 ## How it connects
 

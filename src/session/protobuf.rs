@@ -21,8 +21,8 @@ pub struct Field {
 
 pub fn try_decode(bytes: &[u8], opts: &DecodeOptions) -> Option<(String, bool)> {
     #[cfg(feature = "proto")]
-    if let (Some(ty), Some(pool)) = (opts.proto_type, opts.pool)
-        && let Some(json) = pool.decode_named(ty, bytes)
+    if let Some(pool) = opts.pool
+        && let Ok(json) = pool.decode_named(opts.proto_type, bytes)
     {
         return Some((json, true));
     }
@@ -188,56 +188,158 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 }
 
 #[cfg(feature = "proto")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum NamedError {
+    NoType { candidates: Vec<String> },
+    UnknownType { name: String, candidates: Vec<String> },
+    Ambiguous { name: String, candidates: Vec<String> },
+    DecodeFailed { name: String, msg: String },
+}
+
+#[cfg(feature = "proto")]
+impl std::fmt::Display for NamedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NamedError::NoType { candidates } => write!(
+                f,
+                "no proto_type given and the file defines {} messages; pass one of: {}",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+            NamedError::UnknownType { name, candidates } => write!(
+                f,
+                "unknown proto_type '{name}'; the file defines: {}",
+                candidates.join(", ")
+            ),
+            NamedError::Ambiguous { name, candidates } => write!(
+                f,
+                "proto_type '{name}' is ambiguous; qualify with package: {}",
+                candidates.join(", ")
+            ),
+            NamedError::DecodeFailed { name, msg } => {
+                write!(f, "'{name}' did not match the wire bytes: {msg}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "proto")]
 pub struct ProtoPool {
     pool: prost_reflect::DescriptorPool,
+    primary: String,
 }
 
 #[cfg(feature = "proto")]
 impl ProtoPool {
-    pub fn load_dir(dir: &std::path::Path) -> Result<Self, crate::error::CharlesError> {
+    pub fn load_file(
+        file: &std::path::Path,
+        root: Option<&std::path::Path>,
+    ) -> Result<Self, crate::error::CharlesError> {
         use crate::error::CharlesError;
 
-        let mut files = Vec::new();
-        collect_protos(dir, &mut files)?;
+        let root_buf = match root {
+            Some(r) => r.to_path_buf(),
+            None => file
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        };
 
-        let mut compiler = protox::Compiler::new([dir])
+        let mut compiler = protox::Compiler::new([root_buf.as_path()])
             .map_err(|e| CharlesError::Parse(format!("protox init: {e}")))?;
-        compiler
-            .open_files(files)
-            .map_err(|e| CharlesError::Parse(format!("protox compile: {e}")))?;
+        compiler.include_imports(true);
+        compiler.open_files([file.to_path_buf()]).map_err(|e| {
+            CharlesError::Parse(format!("protox compile {}: {e}", file.display()))
+        })?;
         let bytes = compiler.encode_file_descriptor_set();
         let pool = prost_reflect::DescriptorPool::decode(bytes.as_slice())
             .map_err(|e| CharlesError::Parse(format!("descriptor pool: {e}")))?;
-        Ok(ProtoPool { pool })
+        let primary = file
+            .strip_prefix(&root_buf)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        Ok(ProtoPool { pool, primary })
     }
 
-    pub fn decode_named(&self, fq_name: &str, bytes: &[u8]) -> Option<String> {
-        let desc = self.pool.get_message_by_name(fq_name)?;
-        let msg = prost_reflect::DynamicMessage::decode(desc, bytes).ok()?;
+    fn primary_messages(&self) -> Vec<prost_reflect::MessageDescriptor> {
+        self.pool
+            .all_messages()
+            .filter(|m| m.parent_file().name() == self.primary)
+            .collect()
+    }
+
+    fn resolve(
+        &self,
+        proto_type: Option<&str>,
+    ) -> Result<prost_reflect::MessageDescriptor, NamedError> {
+        let candidates = self.primary_messages();
+        match proto_type {
+            None => {
+                let mut it = candidates.into_iter();
+                match (it.next(), it.next()) {
+                    (Some(only), None) => Ok(only),
+                    (first, second) => Err(NamedError::NoType {
+                        candidates: names(first.into_iter().chain(second).chain(it)),
+                    }),
+                }
+            }
+            Some(name) => {
+                if let Some(m) = self.pool.get_message_by_name(name) {
+                    return Ok(m);
+                }
+                let hits: Vec<_> = candidates
+                    .iter()
+                    .filter(|m| m.name() == name || m.full_name() == name)
+                    .cloned()
+                    .collect();
+                match hits.len() {
+                    1 => Ok(hits.into_iter().next().unwrap()),
+                    0 => Err(NamedError::UnknownType {
+                        name: name.to_string(),
+                        candidates: names(candidates.into_iter()),
+                    }),
+                    _ => Err(NamedError::Ambiguous {
+                        name: name.to_string(),
+                        candidates: names(hits.into_iter()),
+                    }),
+                }
+            }
+        }
+    }
+
+    pub fn resolve_name(&self, proto_type: Option<&str>) -> Result<String, NamedError> {
+        self.resolve(proto_type).map(|m| m.full_name().to_string())
+    }
+
+    pub fn decode_named(&self, proto_type: Option<&str>, bytes: &[u8]) -> Result<String, NamedError> {
+        let desc = self.resolve(proto_type)?;
+        let name = desc.full_name().to_string();
+        let msg = prost_reflect::DynamicMessage::decode(desc, bytes).map_err(|e| {
+            NamedError::DecodeFailed {
+                name: name.clone(),
+                msg: e.to_string(),
+            }
+        })?;
         let mut buf = Vec::new();
         let opts = prost_reflect::SerializeOptions::new()
             .use_proto_field_name(true)
             .skip_default_fields(false);
         msg.serialize_with_options(&mut serde_json::Serializer::pretty(&mut buf), &opts)
-            .ok()?;
-        String::from_utf8(buf).ok()
+            .map_err(|e| NamedError::DecodeFailed {
+                name: name.clone(),
+                msg: e.to_string(),
+            })?;
+        String::from_utf8(buf).map_err(|e| NamedError::DecodeFailed { name, msg: e.to_string() })
     }
 }
 
 #[cfg(feature = "proto")]
-fn collect_protos(
-    dir: &std::path::Path,
-    out: &mut Vec<std::path::PathBuf>,
-) -> Result<(), crate::error::CharlesError> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_protos(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("proto") {
-            out.push(path);
-        }
-    }
-    Ok(())
+fn names(msgs: impl Iterator<Item = prost_reflect::MessageDescriptor>) -> Vec<String> {
+    let mut out: Vec<String> = msgs.map(|m| m.full_name().to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -266,23 +368,25 @@ mod tests {
     }
 
     #[cfg(feature = "proto")]
-    #[test]
-    fn named_decode_ping() {
-        use crate::session::body::DecodeOptions;
+    fn write_proto(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::io::Write;
-
         let dir = tempfile::tempdir().unwrap();
         let proto_path = dir.path().join("ping.proto");
         let mut f = std::fs::File::create(&proto_path).unwrap();
-        write!(
-            f,
-            "syntax = \"proto3\";\nmessage Ping {{ string msg = 1; int32 n = 2; }}\n"
-        )
-        .unwrap();
+        write!(f, "{body}").unwrap();
         f.flush().unwrap();
         drop(f);
+        (dir, proto_path)
+    }
 
-        let pool = ProtoPool::load_dir(dir.path()).expect("load_dir");
+    #[cfg(feature = "proto")]
+    #[test]
+    fn named_decode_ping() {
+        use crate::session::body::DecodeOptions;
+
+        let (_dir, proto_path) =
+            write_proto("syntax = \"proto3\";\nmessage Ping { string msg = 1; int32 n = 2; }\n");
+        let pool = ProtoPool::load_file(&proto_path, None).expect("load_file");
         let bytes = [0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x07];
         let opts = DecodeOptions {
             pool: Some(&pool),
@@ -292,5 +396,73 @@ mod tests {
         assert!(named, "should be a named decode");
         assert!(json.contains("hello"), "json:\n{json}");
         assert!(json.contains('7'), "json:\n{json}");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn short_name_resolves_within_package() {
+        let (_dir, proto_path) = write_proto(
+            "syntax = \"proto3\";\npackage foo.bar;\nmessage Ping { string msg = 1; }\n",
+        );
+        let pool = ProtoPool::load_file(&proto_path, None).expect("load_file");
+        let bytes = [0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f];
+        let json = pool.decode_named(Some("Ping"), &bytes).expect("short name");
+        assert!(json.contains("hello"), "json:\n{json}");
+        let json = pool
+            .decode_named(Some("foo.bar.Ping"), &bytes)
+            .expect("fq name");
+        assert!(json.contains("hello"), "json:\n{json}");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn single_message_infers_type() {
+        let (_dir, proto_path) =
+            write_proto("syntax = \"proto3\";\nmessage Ping { string msg = 1; }\n");
+        let pool = ProtoPool::load_file(&proto_path, None).expect("load_file");
+        let bytes = [0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f];
+        let json = pool.decode_named(None, &bytes).expect("inferred");
+        assert!(json.contains("hello"), "json:\n{json}");
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn ambiguous_short_name_is_reported() {
+        let (_dir, proto_path) = write_proto(
+            "syntax = \"proto3\";\npackage demo;\n\
+             message A { message Ping { string x = 1; } }\n\
+             message B { message Ping { int32 y = 1; } }\n",
+        );
+        let pool = ProtoPool::load_file(&proto_path, None).expect("load_file");
+        let err = pool.decode_named(Some("Ping"), &[0x0a]).unwrap_err();
+        match err {
+            NamedError::Ambiguous { candidates, .. } => {
+                assert!(
+                    candidates.iter().any(|c| c == "demo.A.Ping")
+                        && candidates.iter().any(|c| c == "demo.B.Ping"),
+                    "got: {candidates:?}"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "proto")]
+    #[test]
+    fn unknown_type_lists_candidates() {
+        let (_dir, proto_path) = write_proto(
+            "syntax = \"proto3\";\nmessage Ping { string msg = 1; }\nmessage Pong { int32 n = 1; }\n",
+        );
+        let pool = ProtoPool::load_file(&proto_path, None).expect("load_file");
+        let err = pool.decode_named(Some("Nope"), &[0x0a]).unwrap_err();
+        match err {
+            NamedError::UnknownType { candidates, .. } => {
+                assert!(candidates.iter().any(|c| c == "Ping"), "got: {candidates:?}");
+                assert!(candidates.iter().any(|c| c == "Pong"), "got: {candidates:?}");
+            }
+            other => panic!("expected UnknownType, got {other:?}"),
+        }
+        let err = pool.decode_named(None, &[0x0a]).unwrap_err();
+        assert!(matches!(err, NamedError::NoType { .. }), "got: {err:?}");
     }
 }

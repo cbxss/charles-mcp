@@ -1,5 +1,6 @@
 pub mod schema;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -153,8 +154,127 @@ impl TrafficStore {
             params![capture_id, kind, source, source_key, new_gen, created_at, now, entry_count as i64],
         )?;
 
+        let keys = compute_entry_keys(session);
         for (seq, t) in session.transactions.iter().enumerate() {
-            ingest_entry(&tx, capture_id, seq, t, fts_cap)?;
+            let (entry_key, content_hash) = &keys[seq];
+            ingest_entry(&tx, capture_id, seq, entry_key, content_hash, t, fts_cap)?;
+        }
+
+        tx.execute(
+            "DELETE FROM bodies WHERE sha256 NOT IN (
+               SELECT req_body_sha  FROM entries   WHERE req_body_sha  IS NOT NULL
+               UNION SELECT resp_body_sha FROM entries   WHERE resp_body_sha IS NOT NULL
+               UNION SELECT body_sha      FROM ws_frames WHERE body_sha      IS NOT NULL)",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(CaptureRef {
+            capture_id: capture_id.to_string(),
+            generation: new_gen,
+            entry_count,
+        })
+    }
+
+    pub fn ingest_incremental(
+        &self,
+        capture_id: &str,
+        kind: &str,
+        source: Option<&str>,
+        source_key: Option<&str>,
+        session: &Session,
+        fts_cap: usize,
+    ) -> Result<CaptureRef, CharlesError> {
+        let now = now();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+
+        let prev: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT generation, created_at FROM captures WHERE capture_id = ?1",
+                params![capture_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let new_gen = prev.as_ref().map(|(g, _)| g + 1).unwrap_or(0);
+        let created_at = prev.map(|(_, c)| c).unwrap_or_else(|| now.clone());
+
+        let mut existing: HashMap<String, (i64, String)> = HashMap::new();
+        let mut anchor: Option<(i64, String)> = None;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT entry_key, seq, content_hash FROM entries \
+                 WHERE capture_id = ?1 AND entry_key IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![capture_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (key, seq, ch) = row?;
+                if anchor.as_ref().is_none_or(|(s, _)| seq < *s) {
+                    anchor = Some((seq, key.clone()));
+                }
+                existing.insert(key, (seq, ch.unwrap_or_default()));
+            }
+        }
+
+        let keys = compute_entry_keys(session);
+        let fetched_has = |k: &str| keys.iter().any(|(key, _)| key == k);
+
+        let reset =
+            !existing.is_empty() && anchor.as_ref().is_none_or(|(_, k)| !fetched_has(k));
+        if reset {
+            tx.execute(
+                "DELETE FROM entries_fts WHERE rowid IN (SELECT rowid FROM entries WHERE capture_id = ?1)",
+                params![capture_id],
+            )?;
+            tx.execute(
+                "DELETE FROM entries WHERE capture_id = ?1",
+                params![capture_id],
+            )?;
+            existing.clear();
+        }
+
+        let new_count = keys.iter().filter(|(k, _)| !existing.contains_key(k)).count();
+        let entry_count = existing.len() + new_count;
+
+        tx.execute(
+            "INSERT INTO captures
+               (capture_id, kind, source, source_key, generation, created_at, last_used, entry_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(capture_id) DO UPDATE SET
+               kind=excluded.kind, source=excluded.source, source_key=excluded.source_key,
+               generation=excluded.generation, last_used=excluded.last_used,
+               entry_count=excluded.entry_count",
+            params![capture_id, kind, source, source_key, new_gen, created_at, now, entry_count as i64],
+        )?;
+
+        let mut next_seq: i64 = existing
+            .values()
+            .map(|(s, _)| *s)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+
+        for (i, t) in session.transactions.iter().enumerate() {
+            let (key, ch) = &keys[i];
+            match existing.get(key) {
+                Some((_, old_ch)) if old_ch == ch => {}
+                Some((seq, _)) => {
+                    let seq = *seq;
+                    delete_entry(&tx, capture_id, seq)?;
+                    ingest_entry(&tx, capture_id, seq as usize, key, ch, t, fts_cap)?;
+                }
+                None => {
+                    let seq = next_seq;
+                    next_seq += 1;
+                    ingest_entry(&tx, capture_id, seq as usize, key, ch, t, fts_cap)?;
+                }
+            }
         }
 
         tx.execute(
@@ -389,6 +509,55 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn base_key(t: &Transaction) -> String {
+    let mut h = Sha256::new();
+    let started = t.started.map(|d| d.to_rfc3339()).unwrap_or_default();
+    for field in [
+        started.as_str(),
+        t.method.as_str(),
+        t.host.as_str(),
+        t.url.as_str(),
+        t.client_addr.as_deref().unwrap_or(""),
+    ] {
+        h.update([0u8]);
+        h.update(field.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn content_hash(t: &Transaction) -> String {
+    let mut h = Sha256::new();
+    let fields: [String; 7] = [
+        t.status.map(|s| s as i64).unwrap_or(-1).to_string(),
+        t.status_text.clone().unwrap_or_default(),
+        t.duration_ms.map(|d| d.to_bits()).unwrap_or(0).to_string(),
+        t.response_size.map(|s| s as i64).unwrap_or(-1).to_string(),
+        t.error.clone().unwrap_or_default(),
+        (t.response.is_some() as u8).to_string(),
+        t.websocket.as_ref().map(|f| f.len()).unwrap_or(0).to_string(),
+    ];
+    for f in &fields {
+        h.update([0u8]);
+        h.update(f.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn compute_entry_keys(session: &Session) -> Vec<(String, String)> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    session
+        .transactions
+        .iter()
+        .map(|t| {
+            let base = base_key(t);
+            let dup = counts.entry(base.clone()).or_insert(0);
+            let key = format!("{base}:{dup}");
+            *dup += 1;
+            (key, content_hash(t))
+        })
+        .collect()
+}
+
 fn body_key(raw: &RawBody) -> String {
     let mut h = Sha256::new();
     h.update(&raw.bytes);
@@ -462,6 +631,8 @@ fn ingest_entry(
     tx: &rusqlite::Transaction<'_>,
     capture_id: &str,
     seq: usize,
+    entry_key: &str,
+    content_hash: &str,
     t: &Transaction,
     fts_cap: usize,
 ) -> Result<(), CharlesError> {
@@ -482,17 +653,19 @@ fn ingest_entry(
 
     tx.execute(
         "INSERT INTO entries
-           (entry_id, capture_id, seq, method, scheme, host, path, url, response_status, status_text,
-            mime, response_size, duration_ms, started, protocol, client_addr, remote_addr, tls_version,
-            error, tunnel, is_websocket, resource_class, priority, priority_reasons,
-            req_headers_json, resp_headers_json, req_captured, resp_captured, has_response,
-            req_body_sha, resp_body_sha)
+           (entry_id, capture_id, seq, entry_key, content_hash, method, scheme, host, path, url,
+            response_status, status_text, mime, response_size, duration_ms, started, protocol,
+            client_addr, remote_addr, tls_version, error, tunnel, is_websocket, resource_class,
+            priority, priority_reasons, req_headers_json, resp_headers_json, req_captured,
+            resp_captured, has_response, req_body_sha, resp_body_sha)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,
-                 ?24,?25,?26,?27,?28,?29,?30,?31)",
+                 ?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",
         params![
             entry_id,
             capture_id,
             seq as i64,
+            entry_key,
+            content_hash,
             t.method,
             t.scheme,
             t.host,
@@ -561,17 +734,35 @@ fn fts_text(t: &Transaction, cap: usize) -> (String, String) {
     }
 
     let mut body_text = String::new();
-    let mut push_body = |raw: &RawBody| {
-        match body::decode(raw, cap) {
-            crate::session::Body::Text { text, .. } => body_text.push_str(&text),
-            crate::session::Body::Protobuf { tree, .. } => body_text.push_str(&tree),
-            _ => {}
+    {
+        let mut push_body = |raw: &RawBody| {
+            match body::decode(raw, cap) {
+                crate::session::Body::Text { text, .. } => body_text.push_str(&text),
+                crate::session::Body::Protobuf { tree, .. } => body_text.push_str(&tree),
+                _ => {}
+            }
+            body_text.push('\n');
+        };
+        push_body(&t.request.raw);
+        if let Some(r) = &t.response {
+            push_body(&r.raw);
         }
-        body_text.push('\n');
-    };
-    push_body(&t.request.raw);
-    if let Some(r) = &t.response {
-        push_body(&r.raw);
+    }
+
+    if let Some(frames) = &t.websocket {
+        let mut ws_used = 0usize;
+        for m in frames {
+            if ws_used >= cap {
+                break;
+            }
+            let piece = body::ws_frame_text(&m.payload, cap);
+            if piece.is_empty() {
+                continue;
+            }
+            ws_used += piece.len();
+            body_text.push_str(&piece);
+            body_text.push('\n');
+        }
     }
     (headers, body_text)
 }
@@ -767,6 +958,23 @@ fn load_ws_frames(conn: &Connection, entry_id: &str) -> Result<Vec<WsMessage>, C
         });
     }
     Ok(frames)
+}
+
+fn delete_entry(
+    tx: &rusqlite::Transaction<'_>,
+    capture_id: &str,
+    seq: i64,
+) -> Result<(), CharlesError> {
+    tx.execute(
+        "DELETE FROM entries_fts WHERE rowid IN \
+         (SELECT rowid FROM entries WHERE capture_id = ?1 AND seq = ?2)",
+        params![capture_id, seq],
+    )?;
+    tx.execute(
+        "DELETE FROM entries WHERE capture_id = ?1 AND seq = ?2",
+        params![capture_id, seq],
+    )?;
+    Ok(())
 }
 
 fn drop_capture(conn: &Connection, capture_id: &str) -> Result<(), CharlesError> {
